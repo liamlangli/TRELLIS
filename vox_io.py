@@ -1321,22 +1321,57 @@ def project_image_colors(
     return colors.astype(np.float32), fg_mask
 
 
+def _auto_color_axis(coords: np.ndarray, color_image) -> str:
+    """Pick orthographic axis that best matches a single photo to the volume.
+
+    Bias toward elevation views (xz/zy) for typical object photos; use the
+    axis whose projection lands on more image FG with higher color variance.
+    """
+    best_axis = "xz"
+    best_key = (-1.0, -1.0)
+    for axis in ("xz", "xy", "zy"):
+        try:
+            cols, fg = project_image_colors(
+                coords,
+                color_image,
+                axis=axis,
+                percentile=1.0,
+                fill_background=False,
+                depth_fill=False,
+            )
+        except Exception:
+            continue
+        fg = np.asarray(fg, dtype=bool)
+        hit = float(fg.mean()) if fg.size else 0.0
+        if np.any(fg):
+            c = np.asarray(cols, dtype=np.float32)[fg]
+            var = float(c.var(axis=0).mean())
+        else:
+            var = 0.0
+        key = (hit, var)
+        if key > best_key:
+            best_key = key
+            best_axis = axis
+    return best_axis
+
+
 def grid_from_mesh_with_voxel(
     mesh,
-    material_mode: str = "image",
+    material_mode: str = "color",
     alpha_threshold: float = 0.5,
     max_colors: int = 255,
     crop: bool = True,
     solid_material: int = MATERIAL_SOLID,
     color_image=None,
-    color_axis: str = "xy",
+    color_axis: str = "auto",
 ) -> Tuple[VoxelGrid, Optional[np.ndarray]]:
     """Convert a TRELLIS MeshWithVoxel into a VOX2 VoxelGrid.
 
     material_mode:
-      - "image": project ``color_image`` onto occupancy (default; reliable colors)
-      - "color": quantize decoded base_color / alpha attrs
+      - "color": quantize decoded base_color / alpha attrs (default; from TRELLIS)
+      - "image": orthographic-project ``color_image`` onto occupancy
       - "solid": occupancy only
+      - "auto": try color first; fall back to image if attrs missing/flat
     """
     coords = mesh.coords
     if hasattr(coords, "detach"):
@@ -1347,57 +1382,105 @@ def grid_from_mesh_with_voxel(
     coords = coords[:, :3].astype(np.int64)
 
     palette = None
-    mode = material_mode.lower()
+    mode = (material_mode or "color").lower()
 
-    if mode == "solid":
-        materials = np.full(coords.shape[0], solid_material, dtype=np.uint8)
-    elif mode == "image":
-        if color_image is None:
-            raise ValueError("material_mode='image' requires color_image=")
-        # Keep full occupancy; generative alpha is unreliable on the stub Windows path
-        # and was wiping real surface voxels while leaving miscolored interior.
-        if coords.shape[0] == 0:
-            return VoxelGrid.empty(1, 1, 1), np.zeros((0, 3), dtype=np.uint8)
-        # Palette from the real image FG (thatched gold / wood brown / white cloth …)
-        palette = extract_image_palette(
-            color_image,
-            max_colors=max_colors,
-            alpha_threshold=min(alpha_threshold, 0.1),
-        )
-        base, _fg = project_image_colors(
-            coords,
-            color_image,
-            axis=color_axis,
-            percentile=1.0,
-            alpha_threshold=min(alpha_threshold, 0.1),
-            fill_background=True,
-        )
-        materials, palette = materials_from_colors(
-            base,
-            alpha=None,
-            alpha_threshold=0.0,
-            max_colors=max_colors,
-            palette=palette,
-        )
-    elif mode == "color":
-        attrs = mesh.attrs
+    def _from_mesh_color():
+        attrs = getattr(mesh, "attrs", None)
+        if attrs is None:
+            raise ValueError("mesh has no attrs")
         if hasattr(attrs, "detach"):
             attrs = attrs.detach().cpu().numpy()
         attrs = np.asarray(attrs)
+        if attrs.ndim != 2 or attrs.shape[0] != coords.shape[0] or attrs.shape[1] < 3:
+            raise ValueError(f"mesh.attrs shape invalid: {getattr(attrs, 'shape', None)}")
         layout = getattr(mesh, "layout", None) or {
             "base_color": slice(0, 3),
             "alpha": slice(5, 6),
         }
         base = attrs[:, layout["base_color"]]
-        alpha = attrs[:, layout["alpha"]] if "alpha" in layout else None
-        materials, palette = materials_from_colors(
-            base, alpha=alpha, alpha_threshold=alpha_threshold, max_colors=max_colors
+        alpha = attrs[:, layout["alpha"]] if isinstance(layout, dict) and "alpha" in layout else None
+        # Guard against degenerate/constant textures (failed tex decode).
+        base_f = np.asarray(base, dtype=np.float64)
+        if float(np.nanstd(base_f)) < 1e-4:
+            raise ValueError("mesh base_color is flat")
+        mats, pal = materials_from_colors(
+            base,
+            alpha=alpha,
+            # keep nearly-opaque surfaces; generative alpha is soft on edges
+            alpha_threshold=min(float(alpha_threshold), 0.15) if alpha is not None else 0.0,
+            max_colors=max_colors,
         )
+        return mats, pal
+
+    def _from_image_projection():
+        if color_image is None:
+            raise ValueError("material_mode='image' requires color_image=")
+        if coords.shape[0] == 0:
+            return (
+                np.zeros((0,), dtype=np.uint8),
+                np.zeros((0, 3), dtype=np.uint8),
+            )
+        axis = (color_axis or "auto").lower()
+        if axis in ("", "auto"):
+            axis = _auto_color_axis(coords, color_image)
+        # Palette from the real image FG so roof/wood/cloth hues stay faithful.
+        pal = extract_image_palette(
+            color_image,
+            max_colors=max_colors,
+            alpha_threshold=min(float(alpha_threshold), 0.1),
+        )
+        base, _fg = project_image_colors(
+            coords,
+            color_image,
+            axis=axis,
+            percentile=1.0,
+            alpha_threshold=min(float(alpha_threshold), 0.1),
+            fill_background=True,
+        )
+        mats, pal = materials_from_colors(
+            base,
+            alpha=None,
+            alpha_threshold=0.0,
+            max_colors=max_colors,
+            palette=pal,
+        )
+        return mats, pal
+
+    if mode == "solid":
+        materials = np.full(coords.shape[0], solid_material, dtype=np.uint8)
+        palette = np.array([[180, 180, 180]], dtype=np.uint8)
+    elif mode == "color":
+        try:
+            materials, palette = _from_mesh_color()
+        except Exception as exc:
+            if color_image is None:
+                raise
+            print(f"[vox] color mode failed ({exc}); falling back to image projection", flush=True)
+            materials, palette = _from_image_projection()
         keep = materials != 0
-        coords = coords[keep]
-        materials = materials[keep]
+        if np.any(~keep) and np.any(keep):
+            coords = coords[keep]
+            materials = materials[keep]
         if coords.shape[0] == 0:
             return VoxelGrid.empty(1, 1, 1), palette if palette is not None else np.zeros((0, 3), dtype=np.uint8)
+    elif mode == "image":
+        materials, palette = _from_image_projection()
+        if coords.shape[0] == 0:
+            return VoxelGrid.empty(1, 1, 1), np.zeros((0, 3), dtype=np.uint8)
+    elif mode == "auto":
+        try:
+            materials, palette = _from_mesh_color()
+            keep = materials != 0
+            if np.any(keep):
+                coords = coords[keep]
+                materials = materials[keep]
+            else:
+                raise ValueError("color mode produced no solid voxels")
+        except Exception as exc:
+            print(f"[vox] auto->color failed ({exc}); using image projection", flush=True)
+            materials, palette = _from_image_projection()
+            if coords.shape[0] == 0:
+                return VoxelGrid.empty(1, 1, 1), np.zeros((0, 3), dtype=np.uint8)
     else:
         raise ValueError(f"unknown material_mode {material_mode!r}")
 

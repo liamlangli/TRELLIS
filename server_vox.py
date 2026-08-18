@@ -109,14 +109,14 @@ def _parse_convert_options(req: Request) -> dict:
             _pick(req, "pipeline_type", "pipelineType", default=os.environ.get("PIPELINE_TYPE", "512"))
         ),
         "material_mode": str(
-            _pick(req, "material_mode", "materialMode", default=os.environ.get("MATERIAL_MODE", "image"))
+            _pick(req, "material_mode", "materialMode", default=os.environ.get("MATERIAL_MODE", "color"))
         ).lower(),
         "out_res": int(out_res),
         "alpha_threshold": float(
             _pick(req, "alpha_threshold", "alphaThreshold", default=os.environ.get("ALPHA_THR", "0.5"))
         ),
         "color_axis": str(
-            _pick(req, "color_axis", "colorAxis", default=os.environ.get("COLOR_AXIS", "xy"))
+            _pick(req, "color_axis", "colorAxis", default=os.environ.get("COLOR_AXIS", "auto"))
         ),
         "downsample_device": _pick(req, "downsample_device", "downsampleDevice", default=None),
         "include_palette": _as_bool(_pick(req, "include_palette", "includePalette"), False),

@@ -73,7 +73,7 @@ def main() -> int:
     pipeline_type = os.environ.get("PIPELINE_TYPE", "512")
     seed = int(os.environ.get("SEED", "0"))
     model = os.environ.get("TRELLIS_MODEL", "microsoft/TRELLIS.2-4B")
-    material_mode = os.environ.get("MATERIAL_MODE", "image").lower()
+    material_mode = os.environ.get("MATERIAL_MODE", "color").lower()
     out_res = int(os.environ.get("OUT_RES", "256"))
 
     if not image_path.is_file():
@@ -102,7 +102,7 @@ def main() -> int:
         material_mode=material_mode,
         out_res=out_res,
         alpha_threshold=float(os.environ.get("ALPHA_THR", "0.5")),
-        color_axis=os.environ.get("COLOR_AXIS", "xy"),
+        color_axis=os.environ.get("COLOR_AXIS", "auto"),
         downsample_device=os.environ.get("DOWNSAMPLE_DEVICE"),
         include_palette=True,
         include_preview=True,

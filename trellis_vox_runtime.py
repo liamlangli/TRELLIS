@@ -240,10 +240,10 @@ class TrellisVoxRuntime:
         *,
         seed: int = 0,
         pipeline_type: str = "512",
-        material_mode: str = "image",
+        material_mode: str = "color",
         out_res: int = 256,
         alpha_threshold: float = 0.5,
-        color_axis: str = "xy",
+        color_axis: str = "auto",
         downsample_device: Optional[str] = None,
         include_palette: bool = False,
         include_preview: bool = False,
@@ -266,7 +266,7 @@ class TrellisVoxRuntime:
         if pil.mode not in ("RGB", "RGBA"):
             pil = pil.convert("RGBA" if "A" in pil.getbands() else "RGB")
 
-        material_mode = (material_mode or "image").lower()
+        material_mode = (material_mode or "color").lower()
         pipeline_type = pipeline_type or "512"
         out_res = int(out_res)
         seed = int(seed)
@@ -288,8 +288,9 @@ class TrellisVoxRuntime:
                 max_colors=255,
                 crop=True,
                 solid_material=1,
-                color_image=pre_image if material_mode == "image" else None,
-                color_axis=color_axis or "xy",
+                # Always pass preprocessed image so color/auto can fall back to projection.
+                color_image=pre_image,
+                color_axis=color_axis or "auto",
             )
             native_size = (grid.size_x, grid.size_y, grid.size_z)
             native_solid = grid.count_solid()
