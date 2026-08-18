@@ -35,6 +35,10 @@ echo   image: !IN_IMG!
 echo   glb:   !OUT_GLB!
 echo.
 
+if not defined REMESH set "REMESH=0"
+if not defined PIPELINE_TYPE set "PIPELINE_TYPE=512"
+if not defined SPARSE_CONV_BACKEND set "SPARSE_CONV_BACKEND=flex_gemm"
+
 "%SCRIPT_DIR%.venv\Scripts\python.exe" "%SCRIPT_DIR%img_to_glb.py" "!IN_IMG!" "!OUT_GLB!"
 set "ERR=!ERRORLEVEL!"
 if not "!ERR!"=="0" (

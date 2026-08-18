@@ -47,16 +47,29 @@ def bootstrap_env(*, allow_stubs: bool = True) -> None:
     """
     _prepend_sys_path(ROOT)
 
-    # Candidate real package roots (order matters).
-    real_roots = [O_VOXEL_SRC, EXT_CUMESH, EXT_FLEXGEMM]
-    for root in real_roots:
-        _prepend_sys_path(root)
+    # Prefer already-installed site-packages. Only fall back to local extension
+    # source trees if the installed packages are missing.
+    try:
+        import cumesh  # noqa: F401
+        import o_voxel  # noqa: F401
+        from o_voxel import postprocess as _pp  # noqa: F401
+        _have_full = True
+    except Exception:
+        _have_full = False
+    if not _have_full:
+        for root in (EXT_CUMESH, EXT_FLEXGEMM, O_VOXEL_SRC):
+            _prepend_sys_path(root)
 
     # Probe full stack.
     full_ok = False
     try:
         import importlib
 
+        # Drop source shadows so installed wheels win when both exist.
+        for shadow in (str(O_VOXEL_SRC), str(EXT_CUMESH), str(EXT_FLEXGEMM), str(STUBS)):
+            while shadow in sys.path:
+                sys.path.remove(shadow)
+        _purge_modules('o_voxel', 'cumesh', 'flex_gemm')
         importlib.invalidate_caches()
         import cumesh  # noqa: F401
         import o_voxel  # noqa: F401
@@ -81,7 +94,7 @@ def bootstrap_env(*, allow_stubs: bool = True) -> None:
                 f"{type(e).__name__}: {e}"
             ) from e
         # Drop broken sources so stubs can own the names.
-        for root in real_roots:
+        for root in (EXT_CUMESH, EXT_FLEXGEMM, O_VOXEL_SRC, STUBS):
             _drop_sys_path(root)
         _purge_modules("o_voxel", "cumesh", "flex_gemm")
         _prepend_sys_path(STUBS)
@@ -93,13 +106,22 @@ def bootstrap_env(*, allow_stubs: bool = True) -> None:
 
     os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    os.environ.setdefault("SPARSE_CONV_BACKEND", "spconv")
+    os.environ.setdefault("SPARSE_CONV_BACKEND", "flex_gemm")
     os.environ.setdefault("ATTN_BACKEND", "sdpa")
     os.environ.setdefault("SPARSE_ATTN_BACKEND", "xformers")
 
+    # Configure sparse backends before any heavy trellis2 imports bind CONV/ATTN.
+    import trellis2.modules.sparse.config as _sparse_cfg
     import trellis2.modules.sparse.conv.config as _spconv_cfg
 
+    backend = os.environ.get("SPARSE_CONV_BACKEND", "flex_gemm")
+    if backend in ("none", "spconv", "torchsparse", "flex_gemm"):
+        _sparse_cfg.CONV = backend
+    attn = os.environ.get("SPARSE_ATTN_BACKEND") or os.environ.get("ATTN_BACKEND")
+    if attn in ("xformers", "flash_attn", "flash_attn_3"):
+        _sparse_cfg.ATTN = attn
     _spconv_cfg.SPCONV_ALGO = os.environ.get("SPCONV_ALGO", "native")
+    print(f"[runtime] sparse conv backend={_sparse_cfg.CONV} attn={_sparse_cfg.ATTN}", flush=True)
 
 
 @dataclass

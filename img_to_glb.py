@@ -59,7 +59,7 @@ def _usage() -> None:
         "  DECIMATE_TARGET (default 1000000),\n"
         "  TEXTURE_SIZE    (default 2048),\n"
         "  SIMPLIFY_TARGET (default 16777216 nvdiffrast limit),\n"
-        "  REMESH=0|1 (default 1), REMESH_BAND, REMESH_PROJECT\n",
+        "  REMESH=0|1 (default 0; 1 is VRAM-heavy), REMESH_BAND, REMESH_PROJECT\n",
         file=sys.stderr,
     )
 
@@ -133,7 +133,7 @@ def main() -> int:
     decimate = int(os.environ.get("DECIMATE_TARGET", "1000000"))
     tex_size = int(os.environ.get("TEXTURE_SIZE", "2048"))
     simplify_target = int(os.environ.get("SIMPLIFY_TARGET", "16777216"))
-    remesh = os.environ.get("REMESH", "1") != "0"
+    remesh = os.environ.get("REMESH", "0") != "0"
     remesh_band = float(os.environ.get("REMESH_BAND", "1"))
     remesh_project = float(os.environ.get("REMESH_PROJECT", "0"))
 
