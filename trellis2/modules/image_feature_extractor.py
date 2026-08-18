@@ -83,12 +83,25 @@ class DinoV3FeatureExtractor:
         hidden_states = self.model.embeddings(image, bool_masked_pos=None)
         position_embeddings = self.model.rope_embeddings(image)
 
-        for i, layer_module in enumerate(self.model.layer):
-            hidden_states = layer_module(
+        # transformers>=5 moved encoder blocks under model.model.layer;
+        # older builds exposed them directly as model.layer.
+        layer_list = getattr(self.model, "layer", None)
+        if layer_list is None and hasattr(self.model, "model"):
+            layer_list = getattr(self.model.model, "layer", None)
+        if layer_list is None:
+            raise AttributeError("DINOv3ViTModel has no encoder layer list")
+
+        for i, layer_module in enumerate(layer_list):
+            layer_out = layer_module(
                 hidden_states,
                 position_embeddings=position_embeddings,
             )
+            # Some versions return a tuple (hidden_states, ...); keep the first.
+            hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
+        # Match training: always use stateless LayerNorm over the feature dim.
+        # DINOv3's learned self.model.norm rescales features (std≈0.28) and
+        # collapses sparse-structure geometry into noise / noise-like blobs.
         return F.layer_norm(hidden_states, hidden_states.shape[-1:])
         
     @torch.no_grad()
