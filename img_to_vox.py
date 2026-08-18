@@ -3,10 +3,10 @@
 CLI: TRELLIS.2 image → VOX2 (one-shot).
 
 Usage:
-    run_house_to_vox.py input.png [output.vox]
-    # or via launcher: tovox.bat a.png b.vox
+    img_to_vox.py input.png [output.vox]
 
-For repeated conversions without reloading weights, use server_vox.py instead.
+Loads the model in-process. For repeated conversions without reloading
+weights, start server_vox.py / serve.bat and use tovox.bat instead.
 """
 
 from __future__ import annotations
@@ -51,9 +51,25 @@ bootstrap_env()
 import vox_io  # noqa: E402
 
 
+def _usage() -> None:
+    print(
+        "Usage: img_to_vox.py input.png [output.vox]\n"
+        "\n"
+        "Optional env overrides: SEED, PIPELINE_TYPE, MATERIAL_MODE, OUT_RES,\n"
+        "TRELLIS_MODEL, ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE",
+        file=sys.stderr,
+    )
+
+
 def main() -> int:
-    image_path = Path(os.environ.get("HOUSE_IMG", r"C:\Users\lilang02\Downloads\house.jpg"))
-    out_path = Path(os.environ.get("HOUSE_VOX", str(ROOT / "house.vox")))
+    args = [a for a in sys.argv[1:] if a]
+    if not args or args[0] in ("-h", "--help", "/?"):
+        _usage()
+        return 0 if args and args[0] in ("-h", "--help", "/?") else 1
+
+    image_path = Path(args[0])
+    out_path = Path(args[1]) if len(args) >= 2 else image_path.with_suffix(".vox")
+
     pipeline_type = os.environ.get("PIPELINE_TYPE", "512")
     seed = int(os.environ.get("SEED", "0"))
     model = os.environ.get("TRELLIS_MODEL", "microsoft/TRELLIS.2-4B")
