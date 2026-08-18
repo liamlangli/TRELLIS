@@ -1,22 +1,30 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-cd /d "%~dp0"
 
 if "%~1"=="" goto :usage
 if /I "%~1"=="-h" goto :usage
 if /I "%~1"=="--help" goto :usage
 if /I "%~1"=="/?" goto :usage
 
-if not exist "%~1" (
-  echo [ERROR] Image not found: %~1
-  exit /b 1
-)
+REM Keep caller CWD for relative paths; only locate repo tools by script dir.
+set "SCRIPT_DIR=%~dp0"
+set "CALLER_CWD=%CD%"
 
-set "IN_IMG=%~f1"
+REM Resolve input against the caller's current directory.
+pushd "%CALLER_CWD%" >nul
+for %%I in ("%~1") do set "IN_IMG=%%~fI"
 if "%~2"=="" (
-  set "OUT_VOX=%~dpn1.vox"
+  for %%I in ("%~1") do set "OUT_VOX=%%~dpnI.vox"
 ) else (
-  set "OUT_VOX=%~f2"
+  for %%I in ("%~2") do set "OUT_VOX=%%~fI"
+)
+popd >nul
+
+if not exist "!IN_IMG!" (
+  echo [ERROR] Image not found: %~1
+  echo         resolved: !IN_IMG!
+  echo         cwd: %CALLER_CWD%
+  exit /b 1
 )
 
 if not defined VOX_URL (
@@ -55,7 +63,7 @@ if errorlevel 1 (
 curl -sS --fail --max-time 5 "!VOX_URL!/health" >nul 2>nul
 if errorlevel 1 (
   echo [ERROR] Cannot reach VOX server at !VOX_URL!
-  echo Start it first: serve.bat
+  echo Start it first: "%SCRIPT_DIR%serve.bat"
   exit /b 3
 )
 
@@ -100,8 +108,9 @@ echo Usage: tovox.bat input.png [output.vox]
 echo.
 echo Examples:
 echo   tovox.bat a.png b.vox
-echo   tovox.bat a.png
+echo   tovox.bat .\photos\a.png out\b.vox
 echo.
+echo Paths are resolved from the current working directory.
 echo Converts via HTTP against a running server_vox instance.
 echo Start the server first:
 echo   serve.bat
