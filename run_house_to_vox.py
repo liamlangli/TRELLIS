@@ -2,6 +2,10 @@
 """
 CLI: TRELLIS.2 image → VOX2 (one-shot).
 
+Usage:
+    run_house_to_vox.py input.png [output.vox]
+    # or via launcher: tovox.bat a.png b.vox
+
 For repeated conversions without reloading weights, use server_vox.py instead.
 """
 
