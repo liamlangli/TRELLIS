@@ -299,7 +299,11 @@ class TrellisVoxRuntime:
                 )
                 grid = vox_io.downsample_grid(grid, target_max=out_res, device=ds_dev)
 
-            vox_bytes = vox_io.encode(vox_io.swap_yz(grid), use_zstd=True)
+            vox_bytes = vox_io.encode(
+                vox_io.swap_yz(grid),
+                use_zstd=True,
+                palette=palette,
+            )
             palette_png = None
             if include_palette and palette is not None:
                 buf = io.BytesIO()

@@ -1,0 +1,752 @@
+// The `.vox` container itself: headers, bricks, and run-length coding.
+//
+// VOX2 is built like the runtime material pool: the volume is cut into the
+// same 4 x 4 x 4 bricks the world uses, only a brick that holds a non-air
+// voxel is stored, and each brick is RLE-packed. Empty space is the missing
+// brick, not a run of zeroes. The brick records are then a zstd frame when
+// that shrinks them; the 32-byte header stays uncompressed so a reader can
+// see the size and flags without decoding.
+//
+// File layout, little-endian:
+//
+//     magic       : 4 bytes = "VOX2"
+//     version     : u32     = 2
+//     size_x      : u32
+//     size_y      : u32
+//     size_z      : u32
+//     brick       : u32     = 4
+//     flags       : u32     bit 0 = RLE, bit 1 = zstd payload
+//     brick_count : u32
+//     payload     : palette then brick records, or a zstd frame of both
+//
+// Version 2 begins the uncompressed payload with an embedded palette:
+//
+//     palette_count : u32     = 1..256, index 0 is always air
+//     palette       : (r:u8, g:u8, b:u8, material:u8) * palette_count
+//     bricks        : occupied brick records
+//
+// Each brick cell is a palette index, not a world material id. Index 0 is
+// air; every other index names the colour and the nearest world material in
+// that palette slot. The encoder builds the table from the distinct non-air
+// bytes in the grid and remaps those bytes as it packs bricks, so a file
+// carries only the colours it uses. The grid-shaped decoder expands indices
+// back to the material byte so the rest of the project still sees materials;
+// the array-shaped decoder the viewer uses leaves the indices in place and
+// publishes the palette through `vox_last_palette`.
+//
+// Version 1 is the same container without a palette prefix: each brick cell
+// is already a material id. Those files are still accepted on read.
+//
+// Each brick record is `cx:u8 cy:u8 cz:u8` then, when RLE is set:
+//
+//     runs        : u8
+//     run         : (count:u8, value:u8) * runs
+//
+// which expands to exactly 64 cell bytes, X-fastest, then Y, then Z,
+// matching `voxel_grid_index`. A brick that hangs off the volume is padded
+// with air. VOX1 dense files are still accepted on read.
+//
+// The grid is not forced to a cube: the voxelizer's bounding box is what is
+// written. `vox_to_cube` remains for callers that still want a cube.
+//
+// Nothing here compresses or touches a file. `vox_io.ns` adds the zstd framing
+// and the `os` reads and writes on top, and stays out of this module because
+// the browser viewer cannot link `compress` at all: a Wasm target rejects that
+// module outright. What the viewer decodes is exactly what is below.
+//
+// The decoding core works on a plain `[u8]` of cells plus the three sizes,
+// rather than on a `voxel_grid`, and the grid-shaped entries are wrappers over
+// it. That is not a stylistic preference: the Wasm backend cannot carry an
+// array through a struct field at all, so a `voxel_grid` reaches the browser
+// with an empty `data`. Keeping the real work array-shaped is what lets the
+// desktop converter and the browser viewer decode through the same lines
+// instead of through two implementations of one format.
+
+use std
+
+lit VOX1_HEADER_SIZE = 16
+lit VOX2_HEADER_SIZE = 32
+lit VOX2_VERSION = 2
+lit VOX2_VERSION_MIN = 1
+lit VOX2_FLAG_RLE = 1
+lit VOX2_FLAG_ZSTD = 2
+lit VOX2_BRICK = WORLD_CHUNK_SIZE
+lit VOX2_BRICK_CELLS = WORLD_CHUNK_VOXELS
+// One coord triple plus a worst-case RLE brick: a run per cell.
+lit VOX2_BRICK_BOUND = 3 + 1 + VOX2_BRICK_CELLS * 2
+// Palette lives in the uncompressed payload so the 32-byte header and the
+// zstd framing stay the same shape they were. Count word plus 256 RGBA slots.
+lit VOX_PALETTE_MAX = 256
+lit VOX_PALETTE_BYTES = VOX_PALETTE_MAX * 4
+lit VOX2_PALETTE_PREFIX_MAX = 4 + VOX_PALETTE_BYTES
+
+// The size field is bounded on read so a corrupt header cannot ask for a
+// multi-gigabyte allocation before the length check would have rejected it.
+lit VOX_SIZE_MAX = 1024
+
+let vox_last_bricks = 0
+let vox_last_bytes = 0
+let vox_last_plain = 0
+let vox_last_palette = [u8](VOX_PALETTE_BYTES)
+let vox_last_palette_count = 0
+
+fn vox_read_u32(bytes: [u8], offset: i32) i32 {
+    let b0 = bytes[offset] as i32
+    let b1 = bytes[offset + 1] as i32
+    let b2 = bytes[offset + 2] as i32
+    let b3 = bytes[offset + 3] as i32
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn vox_write_u32(bytes: [u8], offset: i32, value: i32) {
+    bytes[offset] = (value & 255) as u8
+    bytes[offset + 1] = ((value >> 8) & 255) as u8
+    bytes[offset + 2] = ((value >> 16) & 255) as u8
+    bytes[offset + 3] = ((value >> 24) & 255) as u8
+}
+
+fn vox_is_v1(bytes: [u8]) bool {
+    return bytes[0] == 86 && bytes[1] == 79 && bytes[2] == 88 && bytes[3] == 49
+}
+
+fn vox_is_v2(bytes: [u8]) bool {
+    return bytes[0] == 86 && bytes[1] == 79 && bytes[2] == 88 && bytes[3] == 50
+}
+
+fn vox_has_magic(bytes: [u8]) bool {
+    return vox_is_v2(bytes) || vox_is_v1(bytes)
+}
+
+fn vox_bricks_on(size: i32) i32 {
+    if size <= 0 { return 0 }
+    return (size + VOX2_BRICK - 1) / VOX2_BRICK
+}
+
+fn vox_grid_ok(grid: ref voxel_grid) bool {
+    if grid.size_x <= 0 || grid.size_y <= 0 || grid.size_z <= 0 { return false }
+    if grid.size_x > VOX_SIZE_MAX || grid.size_y > VOX_SIZE_MAX || grid.size_z > VOX_SIZE_MAX {
+        return false
+    }
+    return grid.data.len >= voxel_grid_cells(grid)
+}
+
+fn vox_rle_runs(src: [u8], length: i32) i32 {
+    if length <= 0 { return 0 }
+    let runs = 1
+    let prev = src[0]
+    for index in 1 to length {
+        if src[index] != prev {
+            runs = runs + 1
+            prev = src[index]
+        }
+    }
+    return runs
+}
+
+fn vox_rle_write(src: [u8], length: i32, dst: [u8], offset: i32) i32 {
+    let runs = vox_rle_runs(src, length)
+    if runs <= 0 || runs > 255 { return 0 }
+    if offset + 1 + runs * 2 > dst.len { return 0 }
+    dst[offset] = runs as u8
+    let cursor = offset + 1
+    let index = 0
+    loop index < length {
+        let value = src[index]
+        let count = 1
+        loop index + count < length && count < 255 && src[index + count] == value {
+            count = count + 1
+        }
+        dst[cursor] = count as u8
+        dst[cursor + 1] = value
+        cursor = cursor + 2
+        index = index + count
+    }
+    return cursor - offset
+}
+
+// Expand one brick. Returns the byte after the last run, or -1.
+fn vox_rle_read(src: [u8], offset: i32, src_len: i32, dst: [u8], length: i32) i32 {
+    if offset >= src_len { return -1 }
+    let runs = src[offset] as i32
+    if runs <= 0 { return -1 }
+    let cursor = offset + 1
+    let written = 0
+    for run in 0 to runs {
+        if cursor + 2 > src_len { return -1 }
+        let count = src[cursor] as i32
+        let value = src[cursor + 1]
+        cursor = cursor + 2
+        if count <= 0 || written + count > length { return -1 }
+        for step in 0 to count {
+            dst[written + step] = value
+        }
+        written = written + count
+    }
+    if written != length { return -1 }
+    return cursor
+}
+
+// Copy one brick into `out` (air-padded). `remap` turns a grid byte into the
+// value stored in the file; an identity table writes the grid unchanged.
+// Returns true when any cell is solid.
+fn vox_brick_extract_mapped(grid: ref voxel_grid, bx: i32, by: i32, bz: i32, out: [u8], remap: [u8]) bool {
+    let x0 = bx * VOX2_BRICK
+    let y0 = by * VOX2_BRICK
+    let z0 = bz * VOX2_BRICK
+    let occupied = false
+    let index = 0
+    for lz in 0 to VOX2_BRICK {
+        let z = z0 + lz
+        for ly in 0 to VOX2_BRICK {
+            let y = y0 + ly
+            for lx in 0 to VOX2_BRICK {
+                let x = x0 + lx
+                let material = 0 as u8
+                if x < grid.size_x && y < grid.size_y && z < grid.size_z {
+                    material = remap[grid.data[voxel_grid_index(grid, x, y, z)] as i32]
+                }
+                out[index] = material
+                if material != 0 { occupied = true }
+                index = index + 1
+            }
+        }
+    }
+    return occupied
+}
+
+fn vox_brick_extract(grid: ref voxel_grid, bx: i32, by: i32, bz: i32, out: [u8]) bool {
+    let x0 = bx * VOX2_BRICK
+    let y0 = by * VOX2_BRICK
+    let z0 = bz * VOX2_BRICK
+    let occupied = false
+    let index = 0
+    for lz in 0 to VOX2_BRICK {
+        let z = z0 + lz
+        for ly in 0 to VOX2_BRICK {
+            let y = y0 + ly
+            for lx in 0 to VOX2_BRICK {
+                let x = x0 + lx
+                let material = 0 as u8
+                if x < grid.size_x && y < grid.size_y && z < grid.size_z {
+                    material = grid.data[voxel_grid_index(grid, x, y, z)]
+                }
+                out[index] = material
+                if material != 0 { occupied = true }
+                index = index + 1
+            }
+        }
+    }
+    return occupied
+}
+
+// The cell offset a size triple puts a voxel at: X fastest, then Y, then Z.
+fn vox_cell_index(size_x: i32, size_y: i32, x: i32, y: i32, z: i32) i32 {
+    return x + y * size_x + z * size_x * size_y
+}
+
+fn vox_brick_scatter_into(data: [u8], size_x: i32, size_y: i32, size_z: i32, bx: i32, by: i32, bz: i32, src: [u8]) {
+    let x0 = bx * VOX2_BRICK
+    let y0 = by * VOX2_BRICK
+    let z0 = bz * VOX2_BRICK
+    let index = 0
+    for lz in 0 to VOX2_BRICK {
+        let z = z0 + lz
+        for ly in 0 to VOX2_BRICK {
+            let y = y0 + ly
+            for lx in 0 to VOX2_BRICK {
+                let x = x0 + lx
+                if x < size_x && y < size_y && z < size_z {
+                    data[vox_cell_index(size_x, size_y, x, y, z)] = src[index]
+                }
+                index = index + 1
+            }
+        }
+    }
+}
+
+fn vox_brick_scatter(grid: ref voxel_grid, bx: i32, by: i32, bz: i32, src: [u8]) {
+    vox_brick_scatter_into(grid.data, grid.size_x, grid.size_y, grid.size_z, bx, by, bz, src)
+}
+
+fn vox_count_bricks(grid: ref voxel_grid) i32 {
+    let bricks_x = vox_bricks_on(grid.size_x)
+    let bricks_y = vox_bricks_on(grid.size_y)
+    let bricks_z = vox_bricks_on(grid.size_z)
+    if bricks_x > 256 || bricks_y > 256 || bricks_z > 256 { return 0 }
+    let scratch = [u8](VOX2_BRICK_CELLS)
+    let count = 0
+    let total = bricks_x * bricks_y * bricks_z
+    let walked = 0
+    if total > 0 { vox_progress_bar(0, total, "bricks") }
+    for bz in 0 to bricks_z {
+        for by in 0 to bricks_y {
+            for bx in 0 to bricks_x {
+                if vox_brick_extract(grid, bx, by, bz, scratch) {
+                    count = count + 1
+                }
+                walked = walked + 1
+                vox_progress_bar(walked, total, "bricks")
+            }
+        }
+    }
+    return count
+}
+
+fn vox_copy_bytes(src: [u8], src_off: i32, dst: [u8], dst_off: i32, count: i32) {
+    for index in 0 to count {
+        dst[dst_off + index] = src[src_off + index]
+    }
+}
+
+fn vox_u8_from_unit(value: f32) u8 {
+    let scaled = value * 255.0 + 0.5
+    if scaled < 0.0 { return 0 as u8 }
+    if scaled > 255.0 { return 255 as u8 }
+    return scaled as i32 as u8
+}
+
+// One palette slot: 8-bit colour plus the world material a game consumer
+// expands an index back to.
+fn vox_palette_store(palette: [u8], index: i32, red: f32, green: f32, blue: f32, material: i32) {
+    let base = index * 4
+    palette[base] = vox_u8_from_unit(red)
+    palette[base + 1] = vox_u8_from_unit(green)
+    palette[base + 2] = vox_u8_from_unit(blue)
+    palette[base + 3] = (material & 255) as u8
+}
+
+fn vox_palette_clear() {
+    vox_last_palette_count = 0
+    for index in 0 to VOX_PALETTE_BYTES {
+        vox_last_palette[index] = 0 as u8
+    }
+}
+
+fn vox_palette_publish(palette: [u8], count: i32) {
+    vox_palette_clear()
+    if count <= 0 { return }
+    let bytes = count * 4
+    if bytes > VOX_PALETTE_BYTES { bytes = VOX_PALETTE_BYTES }
+    vox_copy_bytes(palette, 0, vox_last_palette, 0, bytes)
+    vox_last_palette_count = count
+}
+
+// The world material a palette index names, or air when the slot is missing.
+fn vox_palette_material(index: i32) i32 {
+    if index <= 0 || index >= vox_last_palette_count { return MAT_AIR }
+    return vox_last_palette[index * 4 + 3] as i32
+}
+
+// Version 1 files have no prefix, so a viewer that always looks up a colour
+// from the last palette needs the world table filled in as if it had been
+// written into the file.
+fn vox_palette_from_world() {
+    let count = MAT_ASH + 1
+    vox_palette_store(vox_last_palette, 0, 0.0, 0.0, 0.0, MAT_AIR)
+    for index in 1 to count {
+        let color = material_color(index)
+        vox_palette_store(vox_last_palette, index, color.x, color.y, color.z, index)
+    }
+    vox_last_palette_count = count
+}
+
+// Distinct non-air cell bytes become palette slots 1..n. Remap[value] is the
+// index that value is written as. Air stays 0. A u8 cell can name at most 255
+// solids, so the 256-slot table always fits.
+fn vox_palette_build(grid: ref voxel_grid, palette: [u8], remap: [u8]) i32 {
+    for index in 0 to VOX_PALETTE_MAX {
+        remap[index] = 0 as u8
+    }
+    vox_palette_store(palette, 0, 0.0, 0.0, 0.0, MAT_AIR)
+    let count = 1
+    let cells = voxel_grid_cells(grid)
+    for index in 0 to cells {
+        let value = grid.data[index] as i32
+        if value == 0 { continue }
+        if (remap[value] as i32) != 0 { continue }
+        if count >= VOX_PALETTE_MAX { continue }
+        remap[value] = count as u8
+        let color = material_color(value)
+        vox_palette_store(palette, count, color.x, color.y, color.z, value)
+        count = count + 1
+    }
+    return count
+}
+
+fn vox_palette_prefix_size(count: i32) i32 {
+    return 4 + count * 4
+}
+
+// Read the version-2 prefix. Returns the byte where the brick records start,
+// or -1 when the prefix is missing or claims an impossible count.
+fn vox_palette_read(payload: [u8], payload_len: i32) i32 {
+    if payload_len < 4 { return -1 }
+    let count = vox_read_u32(payload, 0)
+    if count < 1 || count > VOX_PALETTE_MAX { return -1 }
+    let prefix = vox_palette_prefix_size(count)
+    if prefix > payload_len { return -1 }
+    vox_palette_clear()
+    vox_copy_bytes(payload, 4, vox_last_palette, 0, count * 4)
+    vox_last_palette_count = count
+    return prefix
+}
+
+fn vox_expand_materials(data: [u8], cells: i32) {
+    for index in 0 to cells {
+        data[index] = vox_palette_material(data[index] as i32) as u8
+    }
+}
+
+fn vox_write_header(bytes: [u8], grid: ref voxel_grid, brick_count: i32, flags: i32) {
+    bytes[0] = 86
+    bytes[1] = 79
+    bytes[2] = 88
+    bytes[3] = 50
+    vox_write_u32(bytes, 4, VOX2_VERSION)
+    vox_write_u32(bytes, 8, grid.size_x)
+    vox_write_u32(bytes, 12, grid.size_y)
+    vox_write_u32(bytes, 16, grid.size_z)
+    vox_write_u32(bytes, 20, VOX2_BRICK)
+    vox_write_u32(bytes, 24, flags)
+    vox_write_u32(bytes, 28, brick_count)
+}
+
+// Write occupied RLE bricks into `bytes` from `offset`. Cell bytes are run
+// through `remap` first. Returns the number of brick bytes written, or -1.
+fn vox_encode_bricks_mapped(grid: ref voxel_grid, bytes: [u8], offset: i32, remap: [u8]) i32 {
+    let bricks_x = vox_bricks_on(grid.size_x)
+    let bricks_y = vox_bricks_on(grid.size_y)
+    let bricks_z = vox_bricks_on(grid.size_z)
+    if bricks_x > 256 || bricks_y > 256 || bricks_z > 256 { return -1 }
+
+    let scratch = [u8](VOX2_BRICK_CELLS)
+    let cursor = offset
+    let brick_count = 0
+    let total = bricks_x * bricks_y * bricks_z
+    let walked = 0
+    if total > 0 { vox_progress_bar(0, total, "encode") }
+    for bz in 0 to bricks_z {
+        for by in 0 to bricks_y {
+            for bx in 0 to bricks_x {
+                walked = walked + 1
+                if !vox_brick_extract_mapped(grid, bx, by, bz, scratch, remap) {
+                    vox_progress_bar(walked, total, "encode")
+                    continue
+                }
+                if cursor + VOX2_BRICK_BOUND > bytes.len { return -1 }
+                bytes[cursor] = bx as u8
+                bytes[cursor + 1] = by as u8
+                bytes[cursor + 2] = bz as u8
+                let packed = vox_rle_write(scratch, VOX2_BRICK_CELLS, bytes, cursor + 3)
+                if packed <= 0 { return -1 }
+                cursor = cursor + 3 + packed
+                brick_count = brick_count + 1
+                vox_progress_bar(walked, total, "encode")
+            }
+        }
+    }
+    vox_last_bricks = brick_count
+    return cursor - offset
+}
+
+// Write occupied RLE bricks into `bytes` from offset 0, values unchanged.
+// Returns the brick-record length, or -1 on error.
+fn vox_encode_bricks(grid: ref voxel_grid, bytes: [u8]) i32 {
+    let remap = [u8](VOX_PALETTE_MAX)
+    for index in 0 to VOX_PALETTE_MAX {
+        remap[index] = index as u8
+    }
+    let written = vox_encode_bricks_mapped(grid, bytes, 0, remap)
+    if written < 0 { return -1 }
+    vox_last_plain = written
+    return written
+}
+
+// Version-2 uncompressed payload: palette prefix, then remapped bricks.
+// Returns the payload length, or -1 on error.
+fn vox_encode_payload(grid: ref voxel_grid, bytes: [u8]) i32 {
+    let palette = [u8](VOX_PALETTE_BYTES)
+    let remap = [u8](VOX_PALETTE_MAX)
+    let count = vox_palette_build(grid, palette, remap)
+    if count < 1 { return -1 }
+    let prefix = vox_palette_prefix_size(count)
+    if prefix > bytes.len { return -1 }
+    vox_write_u32(bytes, 0, count)
+    vox_copy_bytes(palette, 0, bytes, 4, count * 4)
+    let brick_len = vox_encode_bricks_mapped(grid, bytes, prefix, remap)
+    if brick_len < 0 { return -1 }
+    vox_palette_publish(palette, count)
+    vox_last_plain = prefix + brick_len
+    return vox_last_plain
+}
+
+fn vox_store_payload(bytes: [u8], payload: [u8], payload_len: i32) bool {
+    if payload_len < 0 { return false }
+    if VOX2_HEADER_SIZE + payload_len > bytes.len { return false }
+    vox_copy_bytes(payload, 0, bytes, VOX2_HEADER_SIZE, payload_len)
+    return true
+}
+
+fn vox_clear_grid(grid: ref voxel_grid, size_x: i32, size_y: i32, size_z: i32) bool {
+    return voxel_grid_reset(grid, size_x, size_y, size_z)
+}
+
+fn vox_decode_v1(grid: ref voxel_grid, bytes: [u8], length: i32) bool {
+    if length < VOX1_HEADER_SIZE { return false }
+    let size = vox_read_u32(bytes, 4)
+    if size <= 0 || size > VOX_SIZE_MAX { return false }
+    let cells = size * size * size
+    if length != VOX1_HEADER_SIZE + cells { return false }
+    if !vox_clear_grid(grid, size, size, size) { return false }
+    for index in 0 to cells {
+        grid.data[index] = bytes[VOX1_HEADER_SIZE + index]
+    }
+    vox_palette_from_world()
+    vox_last_bricks = 0
+    vox_last_bytes = length
+    return true
+}
+
+// ---- VOX2 header ------------------------------------------------------------
+//
+// The header is read field by field rather than through a struct so both
+// decoders - this module's plain one and the zstd one in `vox_io.ns` - agree on
+// what a field means without passing a record between them.
+
+fn vox_header_size_x(bytes: [u8]) i32 {
+    return vox_read_u32(bytes, 8)
+}
+
+fn vox_header_size_y(bytes: [u8]) i32 {
+    return vox_read_u32(bytes, 12)
+}
+
+fn vox_header_size_z(bytes: [u8]) i32 {
+    return vox_read_u32(bytes, 16)
+}
+
+fn vox_header_version(bytes: [u8]) i32 {
+    return vox_read_u32(bytes, 4)
+}
+
+fn vox_header_has_palette(bytes: [u8]) bool {
+    return vox_header_version(bytes) >= VOX2_VERSION
+}
+
+fn vox_header_flags(bytes: [u8]) i32 {
+    return vox_read_u32(bytes, 24)
+}
+
+fn vox_header_brick_count(bytes: [u8]) i32 {
+    return vox_read_u32(bytes, 28)
+}
+
+fn vox_header_is_zstd(bytes: [u8]) bool {
+    return (vox_header_flags(bytes) & VOX2_FLAG_ZSTD) != 0
+}
+
+// Everything a decoder must agree with before it allocates anything.
+fn vox_header_ok(bytes: [u8], length: i32) bool {
+    if length < VOX2_HEADER_SIZE { return false }
+    if !vox_is_v2(bytes) { return false }
+    let version = vox_header_version(bytes)
+    if version < VOX2_VERSION_MIN || version > VOX2_VERSION { return false }
+    if vox_read_u32(bytes, 20) != VOX2_BRICK { return false }
+    if (vox_header_flags(bytes) & VOX2_FLAG_RLE) == 0 { return false }
+    let size_x = vox_header_size_x(bytes)
+    let size_y = vox_header_size_y(bytes)
+    let size_z = vox_header_size_z(bytes)
+    if size_x <= 0 || size_y <= 0 || size_z <= 0 { return false }
+    if size_x > VOX_SIZE_MAX || size_y > VOX_SIZE_MAX || size_z > VOX_SIZE_MAX { return false }
+    return vox_header_brick_count(bytes) >= 0
+}
+
+// The volume an image of either version describes, for a caller that owns its
+// storage and has to size and place it before decoding: a VOX1 cube repeats
+// its one side on all three axes, and a VOX2 file carries them separately.
+// Only meaningful once `vox_cells_needed` has answered above zero, which is
+// what establishes that the header is one of the two and is readable at all.
+fn vox_image_size_x(bytes: [u8]) i32 {
+    if vox_is_v1(bytes) { return vox_read_u32(bytes, 4) }
+    return vox_header_size_x(bytes)
+}
+
+fn vox_image_size_y(bytes: [u8]) i32 {
+    if vox_is_v1(bytes) { return vox_read_u32(bytes, 4) }
+    return vox_header_size_y(bytes)
+}
+
+fn vox_image_size_z(bytes: [u8]) i32 {
+    if vox_is_v1(bytes) { return vox_read_u32(bytes, 4) }
+    return vox_header_size_z(bytes)
+}
+
+fn vox_fill_air(data: [u8], cells: i32) {
+    for index in 0 to cells {
+        data[index] = 0 as u8
+    }
+}
+
+// Scatter a brick payload into `data`, which the caller has already sized to
+// `size_x * size_y * size_z` cells and cleared to air.
+fn vox_decode_bricks_into(data: [u8], size_x: i32, size_y: i32, size_z: i32, payload: [u8], payload_off: i32, payload_len: i32, brick_count: i32) bool {
+    let bricks_x = vox_bricks_on(size_x)
+    let bricks_y = vox_bricks_on(size_y)
+    let bricks_z = vox_bricks_on(size_z)
+    let scratch = [u8](VOX2_BRICK_CELLS)
+    let cursor = payload_off
+    if brick_count > 0 { vox_progress_bar(0, brick_count, "decode") }
+    for index in 0 to brick_count {
+        if cursor + 4 > payload_len { return false }
+        let bx = payload[cursor] as i32
+        let by = payload[cursor + 1] as i32
+        let bz = payload[cursor + 2] as i32
+        if bx >= bricks_x || by >= bricks_y || bz >= bricks_z { return false }
+        let next = vox_rle_read(payload, cursor + 3, payload_len, scratch, VOX2_BRICK_CELLS)
+        if next < 0 { return false }
+        vox_brick_scatter_into(data, size_x, size_y, size_z, bx, by, bz, scratch)
+        cursor = next
+        vox_progress_bar(index + 1, brick_count, "decode")
+    }
+    return cursor == payload_len
+}
+
+fn vox_decode_bricks(grid: ref voxel_grid, payload: [u8], payload_off: i32, payload_len: i32, brick_count: i32) bool {
+    return vox_decode_bricks_into(grid.data, grid.size_x, grid.size_y, grid.size_z, payload, payload_off, payload_len, brick_count)
+}
+
+// Fill `grid` from a decompressed brick payload and the header it came with.
+// `length` is the whole image's length, which is only carried so the last-read
+// report matches what a caller passed in.
+fn vox_decode_payload(grid: ref voxel_grid, bytes: [u8], length: i32, payload: [u8], payload_len: i32) bool {
+    let size_x = vox_header_size_x(bytes)
+    let size_y = vox_header_size_y(bytes)
+    let size_z = vox_header_size_z(bytes)
+    if !vox_clear_grid(grid, size_x, size_y, size_z) { return false }
+    let brick_off = 0
+    if vox_header_has_palette(bytes) {
+        brick_off = vox_palette_read(payload, payload_len)
+        if brick_off < 0 { return false }
+    } else {
+        vox_palette_from_world()
+    }
+    let brick_count = vox_header_brick_count(bytes)
+    if !vox_decode_bricks(grid, payload, brick_off, payload_len, brick_count) { return false }
+    if vox_header_has_palette(bytes) {
+        vox_expand_materials(grid.data, voxel_grid_cells(grid))
+    }
+    vox_last_bricks = brick_count
+    vox_last_plain = payload_len
+    vox_last_bytes = length
+    return true
+}
+
+// How many cells an image expands to, or zero when its header is unusable.
+// A caller that owns its own storage - the browser viewer does, because a Wasm
+// build cannot receive one allocated behind a `ref` - sizes the destination
+// with this before decoding into it.
+fn vox_cells_needed(bytes: [u8], length: i32) i32 {
+    if length < 4 { return 0 }
+    if vox_is_v2(bytes) {
+        if !vox_header_ok(bytes, length) { return 0 }
+        return vox_header_size_x(bytes) * vox_header_size_y(bytes) * vox_header_size_z(bytes)
+    }
+    if !vox_is_v1(bytes) { return 0 }
+    if length < VOX1_HEADER_SIZE { return 0 }
+    let size = vox_read_u32(bytes, 4)
+    if size <= 0 || size > VOX_SIZE_MAX { return 0 }
+    let cells = size * size * size
+    if length != VOX1_HEADER_SIZE + cells { return 0 }
+    return cells
+}
+
+// Expand an image that carries no compressed payload into caller-owned cells.
+// `data` must hold at least `vox_cells_needed` bytes; anything past that is
+// left alone.
+fn vox_decode_uncompressed_into(data: [u8], bytes: [u8], length: i32) bool {
+    let cells = vox_cells_needed(bytes, length)
+    if cells <= 0 || data.len < cells { return false }
+    vox_fill_air(data, cells)
+    if vox_is_v1(bytes) {
+        vox_copy_bytes(bytes, VOX1_HEADER_SIZE, data, 0, cells)
+        vox_palette_from_world()
+        vox_last_bricks = 0
+        vox_last_plain = cells
+        vox_last_bytes = length
+        return true
+    }
+    if vox_header_is_zstd(bytes) { return false }
+    let payload_len = length - VOX2_HEADER_SIZE
+    let payload = [u8](payload_len)
+    vox_copy_bytes(bytes, VOX2_HEADER_SIZE, payload, 0, payload_len)
+    let brick_off = 0
+    if vox_header_has_palette(bytes) {
+        brick_off = vox_palette_read(payload, payload_len)
+        if brick_off < 0 { return false }
+    } else {
+        vox_palette_from_world()
+    }
+    let brick_count = vox_header_brick_count(bytes)
+    let ok = vox_decode_bricks_into(data, vox_header_size_x(bytes), vox_header_size_y(bytes), vox_header_size_z(bytes), payload, brick_off, payload_len, brick_count)
+    if !ok { return false }
+    vox_last_bricks = brick_count
+    vox_last_plain = payload_len
+    vox_last_bytes = length
+    return true
+}
+
+// A VOX2 image whose payload is already the plain brick records.
+fn vox_decode_v2_plain(grid: ref voxel_grid, bytes: [u8], length: i32) bool {
+    if !vox_header_ok(bytes, length) { return false }
+    if vox_header_is_zstd(bytes) { return false }
+    let payload_len = length - VOX2_HEADER_SIZE
+    let payload = [u8](payload_len)
+    vox_copy_bytes(bytes, VOX2_HEADER_SIZE, payload, 0, payload_len)
+    return vox_decode_payload(grid, bytes, length, payload, payload_len)
+}
+
+// Parse an in-memory `.vox` image that carries no compressed payload. VOX1
+// dense cubes and plain VOX2 both arrive here; a zstd VOX2 needs `vox_decode`
+// in `vox_io.ns`, which links the decompressor.
+fn vox_decode_uncompressed(grid: ref voxel_grid, bytes: [u8], length: i32) bool {
+    if length < 4 { return false }
+    if vox_is_v2(bytes) { return vox_decode_v2_plain(grid, bytes, length) }
+    if vox_is_v1(bytes) { return vox_decode_v1(grid, bytes, length) }
+    return false
+}
+
+// The side of the smallest cube that holds a grid. Kept for callers that still
+// want a cubic volume; VOX2 itself does not require one.
+fn vox_cube_size(grid: ref voxel_grid) i32 {
+    let size = grid.size_x
+    if grid.size_y > size { size = grid.size_y }
+    if grid.size_z > size { size = grid.size_z }
+    return size
+}
+
+// Centre a grid inside a cube of `size` voxels. The model keeps its footing on
+// the cube's floor rather than being centred vertically too, because an
+// imported prop is placed by its base and a floating one would sink into the
+// ground by half its padding.
+fn vox_to_cube(source: ref voxel_grid, cube: ref voxel_grid, size: i32) bool {
+    if size <= 0 || size > VOX_SIZE_MAX { return false }
+    if source.size_x > size || source.size_y > size || source.size_z > size { return false }
+    if !vox_clear_grid(cube, size, size, size) { return false }
+    let offset_x = (size - source.size_x) / 2
+    let offset_z = (size - source.size_z) / 2
+    if source.size_z > 0 { vox_progress_bar(0, source.size_z, "pack") }
+    for z in 0 to source.size_z {
+        for y in 0 to source.size_y {
+            for x in 0 to source.size_x {
+                let material = source.data[voxel_grid_index(source, x, y, z)]
+                if material == 0 {
+                    continue
+                }
+                let at = (x + offset_x) + y * size + (z + offset_z) * size * size
+                cube.data[at] = material
+            }
+        }
+        vox_progress_bar(z + 1, source.size_z, "pack")
+    }
+    return true
+}

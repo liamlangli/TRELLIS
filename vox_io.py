@@ -1,25 +1,37 @@
 """
-Reader/writer for the VOX2 sparse-brick format defined in vox_io.ns.
+Reader/writer for the VOX2 sparse-brick format defined in vox_codec.ns.
 
 File layout (little-endian):
 
     magic       : 4 bytes = b"VOX2"
-    version     : u32     = 1
+    version     : u32     = 2
     size_x      : u32
     size_y      : u32
     size_z      : u32
     brick       : u32     = 4
     flags       : u32     bit0 = RLE, bit1 = zstd payload
     brick_count : u32
-    payload     : brick records, or a zstd frame of those records
+    payload     : palette then brick records, or a zstd frame of both
+
+Version 2 payload prefix:
+
+    palette_count : u32     = 1..256, index 0 is always air
+    palette       : (r:u8, g:u8, b:u8, material:u8) * palette_count
+    bricks        : occupied brick records
+
+Each brick cell stores a palette index (not a free-floating world material).
+Index 0 is air. Encoder remaps used material bytes into the compact palette.
+Decoder expands indices back to material ids for the rest of this project.
+
+Version 1 is still accepted on read (no palette prefix; cells are materials).
 
 Each RLE brick record is:
     cx:u8 cy:u8 cz:u8
     runs:u8
     (count:u8, value:u8) * runs
 
-which expands to exactly 64 material bytes, X-fastest, then Y, then Z.
-Material 0 is air. Empty bricks are omitted.
+which expands to exactly 64 cell bytes, X-fastest, then Y, then Z.
+Material / palette index 0 is air. Empty bricks are omitted.
 """
 
 from __future__ import annotations
@@ -39,7 +51,8 @@ except ImportError:
 
 VOX1_MAGIC = b"VOX1"
 VOX2_MAGIC = b"VOX2"
-VOX2_VERSION = 1
+VOX2_VERSION = 2
+VOX2_VERSION_MIN = 1
 VOX2_HEADER_SIZE = 32
 VOX1_HEADER_SIZE = 16
 VOX2_FLAG_RLE = 1
@@ -47,7 +60,11 @@ VOX2_FLAG_ZSTD = 2
 VOX2_BRICK = 4
 VOX2_BRICK_CELLS = VOX2_BRICK ** 3
 VOX_SIZE_MAX = 1024
+VOX_PALETTE_MAX = 256
 MATERIAL_SOLID = 1
+
+# Last palette published by encode/decode: shape (count, 4) RGBA bytes where A is material.
+LAST_PALETTE = np.zeros((0, 4), dtype=np.uint8)
 
 PathLike = Union[str, Path]
 
@@ -450,7 +467,13 @@ def _rle_decode(data: bytes, offset: int, length: int = VOX2_BRICK_CELLS) -> Tup
     return out, cursor
 
 
-def _extract_brick(grid: VoxelGrid, bx: int, by: int, bz: int) -> Tuple[np.ndarray, bool]:
+def _extract_brick(
+    grid: VoxelGrid,
+    bx: int,
+    by: int,
+    bz: int,
+    remap: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, bool]:
     x0 = bx * VOX2_BRICK
     y0 = by * VOX2_BRICK
     z0 = bz * VOX2_BRICK
@@ -467,6 +490,8 @@ def _extract_brick(grid: VoxelGrid, bx: int, by: int, bz: int) -> Tuple[np.ndarr
                     material = int(grid.data[z, y, x])
                 else:
                     material = 0
+                if remap is not None:
+                    material = int(remap[material & 255])
                 out[index] = material
                 if material != 0:
                     occupied = True
@@ -490,7 +515,10 @@ def _scatter_brick(grid: VoxelGrid, bx: int, by: int, bz: int, src: np.ndarray) 
                 index += 1
 
 
-def encode_bricks(grid: VoxelGrid) -> Tuple[bytes, int]:
+def encode_bricks(
+    grid: VoxelGrid,
+    remap: Optional[np.ndarray] = None,
+) -> Tuple[bytes, int]:
     if grid.size_x > VOX_SIZE_MAX or grid.size_y > VOX_SIZE_MAX or grid.size_z > VOX_SIZE_MAX:
         raise ValueError("grid exceeds VOX_SIZE_MAX")
     bricks_x = _bricks_on(grid.size_x)
@@ -499,12 +527,21 @@ def encode_bricks(grid: VoxelGrid) -> Tuple[bytes, int]:
     if bricks_x > 256 or bricks_y > 256 or bricks_z > 256:
         raise ValueError("too many bricks along an axis (u8 brick coords)")
 
+    if remap is not None:
+        remap = np.asarray(remap, dtype=np.uint8).reshape(-1)
+        if remap.shape[0] < VOX_PALETTE_MAX:
+            full = np.zeros(VOX_PALETTE_MAX, dtype=np.uint8)
+            full[: remap.shape[0]] = remap
+            remap = full
+        elif remap.shape[0] > VOX_PALETTE_MAX:
+            remap = remap[:VOX_PALETTE_MAX].copy()
+
     chunks: list[bytes] = []
     brick_count = 0
     for bz in range(bricks_z):
         for by in range(bricks_y):
             for bx in range(bricks_x):
-                scratch, occupied = _extract_brick(grid, bx, by, bz)
+                scratch, occupied = _extract_brick(grid, bx, by, bz, remap=remap)
                 if not occupied:
                     continue
                 packed = _rle_encode(scratch)
@@ -513,10 +550,117 @@ def encode_bricks(grid: VoxelGrid) -> Tuple[bytes, int]:
     return b"".join(chunks), brick_count
 
 
-def encode(grid: VoxelGrid, use_zstd: bool = True, zstd_level: int = 3) -> bytes:
+def _normalize_rgb_palette(palette: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    if palette is None:
+        return None
+    pal = np.asarray(palette)
+    if pal.size == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    if pal.ndim == 1:
+        if pal.shape[0] % 3 == 0:
+            pal = pal.reshape(-1, 3)
+        elif pal.shape[0] % 4 == 0:
+            pal = pal.reshape(-1, 4)[:, :3]
+        else:
+            raise ValueError("palette must be (N,3), (N,4), or flat multiples of 3/4")
+    if pal.ndim != 2 or pal.shape[1] < 3:
+        raise ValueError("palette must be (N,3+) RGB values")
+    rgb = pal[:, :3].astype(np.float64)
+    if float(np.nanmax(np.abs(rgb))) <= 1.5:
+        rgb = np.clip(np.rint(rgb * 255.0), 0, 255)
+    else:
+        rgb = np.clip(np.rint(rgb), 0, 255)
+    return rgb.astype(np.uint8)
+
+
+def build_palette_table(
+    grid: VoxelGrid,
+    palette: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build VOX2 palette rows and a 256-entry material->index remap.
+
+    Returns
+    -------
+    table : (count, 4) uint8
+        Rows are (r, g, b, material). Index 0 is always air.
+    remap : (256,) uint8
+        Maps old material bytes to palette indices for brick packing.
+    """
+    rgb_pal = _normalize_rgb_palette(palette)
+    used = np.unique(grid.data.reshape(-1))
+    used = used[used != 0]
+    if used.size > (VOX_PALETTE_MAX - 1):
+        raise ValueError(
+            f"too many distinct materials for VOX palette: {used.size} > {VOX_PALETTE_MAX - 1}"
+        )
+
+    remap = np.zeros(VOX_PALETTE_MAX, dtype=np.uint8)
+    rows = [np.array((0, 0, 0, 0), dtype=np.uint8)]
+    for material in used.tolist():
+        material = int(material) & 255
+        if material == 0 or remap[material] != 0:
+            continue
+        idx = len(rows)
+        if idx >= VOX_PALETTE_MAX:
+            raise ValueError("VOX palette overflow")
+        if rgb_pal is not None and 1 <= material <= rgb_pal.shape[0]:
+            r, g, b = (int(x) for x in rgb_pal[material - 1])
+        elif rgb_pal is not None and 0 <= material < rgb_pal.shape[0]:
+            # tolerate 0-based palettes if callers pass them that way
+            r, g, b = (int(x) for x in rgb_pal[material])
+        else:
+            # deterministic grey fallback so missing colors stay readable
+            tone = 64 + (material * 17) % 160
+            r = g = b = int(tone)
+        rows.append(np.array((r, g, b, material), dtype=np.uint8))
+        remap[material] = np.uint8(idx)
+
+    table = np.stack(rows, axis=0).astype(np.uint8)
+    return table, remap
+
+
+def encode_palette_prefix(table: np.ndarray) -> bytes:
+    table = np.asarray(table, dtype=np.uint8).reshape(-1, 4)
+    count = int(table.shape[0])
+    if count < 1 or count > VOX_PALETTE_MAX:
+        raise ValueError(f"invalid palette_count {count}")
+    return struct.pack("<I", count) + table.tobytes(order="C")
+
+
+def encode(
+    grid: VoxelGrid,
+    use_zstd: bool = True,
+    zstd_level: int = 3,
+    palette: Optional[np.ndarray] = None,
+    *,
+    include_palette: bool = True,
+) -> bytes:
+    """Encode a VOX2 image.
+
+    Parameters
+    ----------
+    palette:
+        Optional RGB/RGBA table. When material ids are already 1..K into this
+        table (as produced by materials_from_colors), those colors are embedded.
+    include_palette:
+        Version-2 files always embed a palette prefix (default). Set False only
+        to emit legacy version-1 payloads for debugging.
+    """
+    global LAST_PALETTE
     if grid.size_x <= 0 or grid.size_y <= 0 or grid.size_z <= 0:
         raise ValueError("grid sizes must be positive")
-    plain, brick_count = encode_bricks(grid)
+
+    if include_palette:
+        table, remap = build_palette_table(grid, palette=palette)
+        bricks, brick_count = encode_bricks(grid, remap=remap)
+        plain = encode_palette_prefix(table) + bricks
+        version = VOX2_VERSION
+        LAST_PALETTE = table.copy()
+    else:
+        plain, brick_count = encode_bricks(grid, remap=None)
+        version = VOX2_VERSION_MIN
+        LAST_PALETTE = np.zeros((0, 4), dtype=np.uint8)
+
     flags = VOX2_FLAG_RLE
     payload = plain
     if use_zstd and plain and zstd is not None:
@@ -528,7 +672,7 @@ def encode(grid: VoxelGrid, use_zstd: bool = True, zstd_level: int = 3) -> bytes
     header = struct.pack(
         "<4sIIIIIII",
         VOX2_MAGIC,
-        VOX2_VERSION,
+        version,
         grid.size_x,
         grid.size_y,
         grid.size_z,
@@ -563,13 +707,57 @@ def _decode_v1(data: bytes) -> VoxelGrid:
     return VoxelGrid(dense.reshape((size, size, size)))
 
 
-def _decode_v2(data: bytes) -> VoxelGrid:
+def _read_palette_prefix(payload: bytes) -> Tuple[np.ndarray, int]:
+    """Return (palette_table (count,4), brick_offset)."""
+    if len(payload) < 4:
+        raise ValueError("truncated palette prefix")
+    (count,) = struct.unpack_from("<I", payload, 0)
+    if count < 1 or count > VOX_PALETTE_MAX:
+        raise ValueError(f"invalid palette_count {count}")
+    need = 4 + count * 4
+    if len(payload) < need:
+        raise ValueError("truncated palette bytes")
+    table = np.frombuffer(payload, dtype=np.uint8, count=count * 4, offset=4).copy()
+    return table.reshape(count, 4), need
+
+
+def _expand_palette_indices(grid: VoxelGrid, table: np.ndarray) -> None:
+    """Replace palette indices in-place with their material bytes."""
+    table = np.asarray(table, dtype=np.uint8).reshape(-1, 4)
+    if table.shape[0] == 0:
+        return
+    materials = table[:, 3]
+    data = grid.data
+    idx = data.astype(np.int32, copy=False)
+    valid = (idx > 0) & (idx < table.shape[0])
+    out = np.zeros_like(data)
+    out[valid] = materials[idx[valid]]
+    grid.data[:] = out
+
+
+def decode_ex(data: bytes) -> Tuple[VoxelGrid, np.ndarray]:
+    """Decode a VOX image and return (grid, palette_rgba).
+
+    palette_rgba has shape (count, 4) with rows (r,g,b,material).
+    Version-1 files return an empty palette table.
+    """
+    global LAST_PALETTE
+    if len(data) < 4:
+        raise ValueError("file too short")
+    magic = data[:4]
+    if magic == VOX1_MAGIC:
+        grid = _decode_v1(data)
+        LAST_PALETTE = np.zeros((0, 4), dtype=np.uint8)
+        return grid, LAST_PALETTE.copy()
+    if magic != VOX2_MAGIC:
+        raise ValueError(f"unknown vox magic {magic!r}")
+
     if len(data) < VOX2_HEADER_SIZE:
         raise ValueError("truncated VOX2 header")
     magic, version, size_x, size_y, size_z, brick, flags, brick_count = struct.unpack_from(
         "<4sIIIIIII", data, 0
     )
-    if magic != VOX2_MAGIC or version != VOX2_VERSION:
+    if magic != VOX2_MAGIC or version < VOX2_VERSION_MIN or version > VOX2_VERSION:
         raise ValueError("unsupported VOX2 header")
     if brick != VOX2_BRICK:
         raise ValueError(f"unsupported brick size {brick}")
@@ -592,11 +780,16 @@ def _decode_v2(data: bytes) -> VoxelGrid:
     else:
         payload = frame
 
+    has_palette = version >= VOX2_VERSION
+    cursor = 0
+    table = np.zeros((0, 4), dtype=np.uint8)
+    if has_palette:
+        table, cursor = _read_palette_prefix(payload)
+
     grid = VoxelGrid.empty(size_x, size_y, size_z)
     bricks_x = _bricks_on(size_x)
     bricks_y = _bricks_on(size_y)
     bricks_z = _bricks_on(size_z)
-    cursor = 0
     for _ in range(brick_count):
         if cursor + 4 > len(payload):
             raise ValueError("truncated brick record")
@@ -607,6 +800,17 @@ def _decode_v2(data: bytes) -> VoxelGrid:
         _scatter_brick(grid, bx, by, bz, scratch)
     if cursor != len(payload):
         raise ValueError(f"payload trailing bytes: {len(payload) - cursor}")
+
+    if has_palette:
+        # Viewer keeps indices+palette; this project expands materials back.
+        _expand_palette_indices(grid, table)
+
+    LAST_PALETTE = table.copy()
+    return grid, table.copy()
+
+
+def _decode_v2(data: bytes) -> VoxelGrid:
+    grid, _palette = decode_ex(data)
     return grid
 
 
@@ -625,9 +829,20 @@ def swap_xy(grid: VoxelGrid) -> VoxelGrid:
     return VoxelGrid(np.ascontiguousarray(np.swapaxes(grid.data, 1, 2)))
 
 
-def write(path: PathLike, grid: VoxelGrid, use_zstd: bool = True, zstd_level: int = 3) -> int:
+def write(
+    path: PathLike,
+    grid: VoxelGrid,
+    use_zstd: bool = True,
+    zstd_level: int = 3,
+    palette: Optional[np.ndarray] = None,
+) -> int:
     # VOX is Y-up; TRELLIS occupancy is Z-up → swap Y/Z on export.
-    raw = encode(swap_yz(grid), use_zstd=use_zstd, zstd_level=zstd_level)
+    raw = encode(
+        swap_yz(grid),
+        use_zstd=use_zstd,
+        zstd_level=zstd_level,
+        palette=palette,
+    )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
@@ -637,6 +852,12 @@ def write(path: PathLike, grid: VoxelGrid, use_zstd: bool = True, zstd_level: in
 def read(path: PathLike) -> VoxelGrid:
     # undo write-time Y/Z swap so in-memory orientation matches TRELLIS (Z-up)
     return swap_yz(decode(Path(path).read_bytes()))
+
+
+def read_ex(path: PathLike) -> Tuple[VoxelGrid, np.ndarray]:
+    """Like read but also returns the embedded palette table."""
+    grid, palette = decode_ex(Path(path).read_bytes())
+    return swap_yz(grid), palette
 
 
 def _rgb_u8(colors: np.ndarray) -> np.ndarray:
@@ -1203,10 +1424,14 @@ __all__ = [
     "VoxelGrid",
     "encode",
     "decode",
+    "decode_ex",
     "read",
+    "read_ex",
     "write",
     "swap_yz",
     "swap_xy",
+    "build_palette_table",
+    "encode_palette_prefix",
     "materials_from_colors",
     "extract_image_palette",
     "project_image_colors",
@@ -1214,7 +1439,10 @@ __all__ = [
     "downsample_grid",
     "downsample_sparse",
     "write_palette_png",
+    "LAST_PALETTE",
     "MATERIAL_SOLID",
     "VOX2_BRICK",
+    "VOX2_VERSION",
+    "VOX_PALETTE_MAX",
     "VOX_SIZE_MAX",
 ]
