@@ -109,7 +109,7 @@ def _parse_convert_options(req: Request) -> dict:
             _pick(req, "pipeline_type", "pipelineType", default=os.environ.get("PIPELINE_TYPE", "512"))
         ),
         "material_mode": str(
-            _pick(req, "material_mode", "materialMode", default=os.environ.get("MATERIAL_MODE", "color"))
+            _pick(req, "material_mode", "materialMode", default=os.environ.get("MATERIAL_MODE", "image"))
         ).lower(),
         "out_res": int(out_res),
         "alpha_threshold": float(

@@ -240,7 +240,7 @@ class TrellisVoxRuntime:
         *,
         seed: int = 0,
         pipeline_type: str = "512",
-        material_mode: str = "color",
+        material_mode: str = "image",
         out_res: int = 256,
         alpha_threshold: float = 0.5,
         color_axis: str = "auto",
@@ -266,7 +266,7 @@ class TrellisVoxRuntime:
         if pil.mode not in ("RGB", "RGBA"):
             pil = pil.convert("RGBA" if "A" in pil.getbands() else "RGB")
 
-        material_mode = (material_mode or "color").lower()
+        material_mode = (material_mode or "image").lower()
         pipeline_type = pipeline_type or "512"
         out_res = int(out_res)
         seed = int(seed)

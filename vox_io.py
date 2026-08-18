@@ -1321,43 +1321,132 @@ def project_image_colors(
     return colors.astype(np.float32), fg_mask
 
 
+def _image_fg_rgb(color_image, *, alpha_threshold: float = 0.1, bg_luma: float = 16.0) -> np.ndarray:
+    """Foreground RGB uint8 samples from a photo (for matching scores)."""
+    _img, fg, rgb_u8 = _load_image_rgb_alpha(
+        color_image, alpha_threshold=alpha_threshold, bg_luma=bg_luma
+    )
+    if np.any(fg):
+        return rgb_u8[fg]
+    return rgb_u8.reshape(-1, 3)
+
+
+def _nn_dist_to_palette(rgb_u8: np.ndarray, palette: np.ndarray, sample_cap: int = 8000) -> float:
+    rgb = np.asarray(rgb_u8, dtype=np.float32).reshape(-1, 3)
+    pal = np.asarray(palette, dtype=np.float32).reshape(-1, 3)
+    if rgb.size == 0 or pal.size == 0:
+        return 1e9
+    if rgb.shape[0] > sample_cap:
+        rng = np.random.default_rng(0)
+        rgb = rgb[rng.choice(rgb.shape[0], size=sample_cap, replace=False)]
+    # chunked L2
+    acc = 0.0
+    n = 0
+    chunk = 4096
+    for i0 in range(0, rgb.shape[0], chunk):
+        part = rgb[i0 : i0 + chunk]
+        d = part[:, None, :] - pal[None, :, :]
+        nn = np.einsum("ijk,ijk->ij", d, d).min(axis=1)
+        acc += float(np.sqrt(nn).sum())
+        n += part.shape[0]
+    return acc / max(n, 1)
+
+
+def _color_noise_score(rgb: np.ndarray) -> float:
+    """Higher = more rainbow/noisy (local multiple-unique colours + high sat spread)."""
+    rgb = np.asarray(rgb, dtype=np.float32).reshape(-1, 3)
+    if rgb.shape[0] < 32:
+        return 0.0
+    # subsample
+    if rgb.shape[0] > 20000:
+        rng = np.random.default_rng(0)
+        rgb = rgb[rng.choice(rgb.shape[0], 20000, replace=False)]
+    # unique after 5-bit crush
+    q = (rgb / 8.0).astype(np.int32)
+    keys = (q[:, 0] << 10) | (q[:, 1] << 5) | q[:, 2]
+    uniq = np.unique(keys).size
+    uniq_frac = uniq / max(rgb.shape[0], 1)
+    mx = rgb.max(axis=1)
+    mn = rgb.min(axis=1)
+    sat = (mx - mn).mean() / 255.0
+    # noisy PBR tends to fill colour space: high unique_frac AND medium/high sat
+    return float(uniq_frac * 2.0 + sat)
+
+
+def _base_color_plausible(base_rgb, color_image=None, *, max_colors: int = 255) -> bool:
+    """Reject flat OR rainbow-noise textures that don't track the input photo."""
+    base = np.asarray(base_rgb, dtype=np.float64)
+    if base.ndim != 2 or base.shape[1] < 3 or base.shape[0] == 0:
+        return False
+    rgb = base[:, :3]
+    # normalize to u8-ish 0..255
+    if float(np.nanmax(np.abs(rgb))) <= 1.5:
+        rgb_u8 = np.clip(np.rint(rgb * 255.0), 0, 255).astype(np.uint8)
+    else:
+        rgb_u8 = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+    if float(np.std(rgb_u8.astype(np.float64))) < 1.0:
+        return False
+    noise = _color_noise_score(rgb_u8)
+    # Fully random textures explode unique colours; real assets cluster.
+    if noise > 1.35:
+        return False
+    if color_image is None:
+        return True
+    try:
+        img_pal = extract_image_palette(color_image, max_colors=min(int(max_colors), 64))
+        dist = _nn_dist_to_palette(rgb_u8, img_pal)
+    except Exception:
+        return noise <= 1.1
+    # house-like assets typically land well under ~35; pure noise is 60+
+    return dist < 42.0
+
+
 def _auto_color_axis(coords: np.ndarray, color_image) -> str:
     """Pick orthographic axis that best matches a single photo to the volume.
 
-    Bias toward elevation views (xz/zy) for typical object photos; use the
-    axis whose projection lands on more image FG with higher color variance.
+    Score = palette match of depth-filled projection, with a strong bias to
+    elevation axes (xz / zy). Top-down xy only wins if it is clearly better.
     """
+    try:
+        img_pal = extract_image_palette(color_image, max_colors=64)
+    except Exception:
+        img_pal = None
     best_axis = "xz"
-    best_key = (-1.0, -1.0)
-    for axis in ("xz", "xy", "zy"):
+    best_score = -1e18
+    scores = {}
+    for axis, bias in (("xz", 3.0), ("zy", 1.5), ("xy", 0.0)):
         try:
-            cols, fg = project_image_colors(
+            cols, _fg = project_image_colors(
                 coords,
                 color_image,
                 axis=axis,
                 percentile=1.0,
-                fill_background=False,
-                depth_fill=False,
+                fill_background=True,
+                depth_fill=True,
             )
-        except Exception:
+        except Exception as exc:
+            scores[axis] = f"err:{exc}"
             continue
-        fg = np.asarray(fg, dtype=bool)
-        hit = float(fg.mean()) if fg.size else 0.0
-        if np.any(fg):
-            c = np.asarray(cols, dtype=np.float32)[fg]
-            var = float(c.var(axis=0).mean())
+        cols_u8 = np.clip(np.rint(np.asarray(cols, dtype=np.float32) * 255.0), 0, 255).astype(
+            np.uint8
+        )
+        if img_pal is not None and cols_u8.size:
+            dist = _nn_dist_to_palette(cols_u8, img_pal)
+            # lower NN distance isbetter; add elevation bias in distance units
+            score = -(float(dist) - bias)
         else:
-            var = 0.0
-        key = (hit, var)
-        if key > best_key:
-            best_key = key
+            score = float(cols_u8.astype(np.float32).std(axis=0).mean()) + bias
+        scores[axis] = score
+        if score > best_score:
+            best_score = score
             best_axis = axis
+    print(f"[vox] axis scores={scores} -> {best_axis}", flush=True)
     return best_axis
 
 
 def grid_from_mesh_with_voxel(
     mesh,
-    material_mode: str = "color",
+    material_mode: str = "image",
     alpha_threshold: float = 0.5,
     max_colors: int = 255,
     crop: bool = True,
@@ -1368,10 +1457,10 @@ def grid_from_mesh_with_voxel(
     """Convert a TRELLIS MeshWithVoxel into a VOX2 VoxelGrid.
 
     material_mode:
-      - "color": quantize decoded base_color / alpha attrs (default; from TRELLIS)
-      - "image": orthographic-project ``color_image`` onto occupancy
+      - "image": orthographic-project ``color_image`` onto occupancy (default)
+      - "color": quantize decoded base_color / alpha attrs from TRELLIS
       - "solid": occupancy only
-      - "auto": try color first; fall back to image if attrs missing/flat
+      - "auto": use mesh colour only when it tracks the photo; else image project
     """
     coords = mesh.coords
     if hasattr(coords, "detach"):
@@ -1382,7 +1471,7 @@ def grid_from_mesh_with_voxel(
     coords = coords[:, :3].astype(np.int64)
 
     palette = None
-    mode = (material_mode or "color").lower()
+    mode = (material_mode or "image").lower()
 
     def _from_mesh_color():
         attrs = getattr(mesh, "attrs", None)
@@ -1399,10 +1488,8 @@ def grid_from_mesh_with_voxel(
         }
         base = attrs[:, layout["base_color"]]
         alpha = attrs[:, layout["alpha"]] if isinstance(layout, dict) and "alpha" in layout else None
-        # Guard against degenerate/constant textures (failed tex decode).
-        base_f = np.asarray(base, dtype=np.float64)
-        if float(np.nanstd(base_f)) < 1e-4:
-            raise ValueError("mesh base_color is flat")
+        if not _base_color_plausible(base, color_image, max_colors=max_colors):
+            raise ValueError("mesh base_color looks flat/noisy or unmatched to image")
         mats, pal = materials_from_colors(
             base,
             alpha=alpha,
@@ -1423,6 +1510,9 @@ def grid_from_mesh_with_voxel(
         axis = (color_axis or "auto").lower()
         if axis in ("", "auto"):
             axis = _auto_color_axis(coords, color_image)
+            print(f"[vox] image projection axis={axis}", flush=True)
+        else:
+            print(f"[vox] image projection axis={axis} (forced)", flush=True)
         # Palette from the real image FG so roof/wood/cloth hues stay faithful.
         pal = extract_image_palette(
             color_image,
