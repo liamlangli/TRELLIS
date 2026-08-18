@@ -16,14 +16,80 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 STUBS = ROOT / "stubs"
+O_VOXEL_SRC = ROOT / "o-voxel"
+EXT_CUMESH = ROOT / ".ext_build" / "CuMesh"
+EXT_FLEXGEMM = ROOT / ".ext_build" / "FlexGEMM"
 
 
-def bootstrap_env() -> None:
-    """Windows-friendly TORCH/spconv defaults + path bootstrap (idempotent)."""
-    if str(STUBS) not in sys.path:
-        sys.path.insert(0, str(STUBS))
-    if str(ROOT) not in sys.path:
-        sys.path.insert(0, str(ROOT))
+def _prepend_sys_path(path: Path) -> None:
+    s = str(path)
+    if path.is_dir() and s not in sys.path:
+        sys.path.insert(0, s)
+
+
+def _drop_sys_path(path: Path) -> None:
+    s = str(path)
+    sys.path[:] = [p for p in sys.path if p != s]
+
+
+def _purge_modules(*prefixes: str) -> None:
+    doomed = [k for k in list(sys.modules) if any(k == p or k.startswith(p + ".") for p in prefixes)]
+    for k in doomed:
+        sys.modules.pop(k, None)
+
+
+def bootstrap_env(*, allow_stubs: bool = True) -> None:
+    """Windows-friendly TORCH/spconv defaults + path bootstrap (idempotent).
+
+    Prefer installed/built packages. Fall back to lightweight stubs only when
+    the real CUDA stack (o_voxel/cumesh/...) cannot be imported — and remove the
+    half-broken source trees from sys.path so stubs actually win.
+    """
+    _prepend_sys_path(ROOT)
+
+    # Candidate real package roots (order matters).
+    real_roots = [O_VOXEL_SRC, EXT_CUMESH, EXT_FLEXGEMM]
+    for root in real_roots:
+        _prepend_sys_path(root)
+
+    # Probe full stack.
+    full_ok = False
+    try:
+        import importlib
+
+        importlib.invalidate_caches()
+        import cumesh  # noqa: F401
+        import o_voxel  # noqa: F401
+        from o_voxel import postprocess as _pp  # noqa: F401
+
+        modfile = str(getattr(o_voxel, "__file__", "") or "").replace("\\", "/")
+        if "stubs" in modfile:
+            raise ImportError("o_voxel resolved to stubs")
+        if not hasattr(_pp, "to_glb"):
+            raise ImportError("o_voxel.postprocess.to_glb missing")
+        # ensure to_glb is not the stub raiser
+        doc = (getattr(_pp.to_glb, "__doc__", "") or "")
+        if "requires full o_voxel" in doc:
+            raise ImportError("stub to_glb still active")
+        full_ok = True
+        print(f"[runtime] full o_voxel stack: {o_voxel.__file__}", flush=True)
+    except Exception as e:
+        full_ok = False
+        if not allow_stubs:
+            raise RuntimeError(
+                "Full o_voxel/cumesh stack is required but import failed: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        # Drop broken sources so stubs can own the names.
+        for root in real_roots:
+            _drop_sys_path(root)
+        _purge_modules("o_voxel", "cumesh", "flex_gemm")
+        _prepend_sys_path(STUBS)
+        print(
+            f"[runtime] WARNING: full mesh stack unavailable ({type(e).__name__}: {e}); "
+            "using stubs fallback (VOX path only, GLB export disabled)",
+            flush=True,
+        )
 
     os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
