@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-CLI: TRELLIS.2 image → VOX2 (one-shot).
+CLI: TRELLIS.2 image -> VOX2 (one-shot).
+
+Default path matches serve.bat:
+  image -> TRELLIS mesh -> textured GLB -> CuMesh voxelize -> VOX2
 
 Usage:
     img_to_vox.py input.png [output.vox]
 
 Loads the model in-process. For repeated conversions without reloading
 weights, start server_vox.py / serve.bat and use tovox.bat instead.
+
+Env: CONVERT_MODE=glb|direct (default glb), SEED, PIPELINE_TYPE, OUT_RES,
+     MATERIAL_MODE (direct only), COLOR_MODE/VOX_FILL/SURFACE_BAND (glb path),
+     TRELLIS_MODEL, ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE
 """
 
 from __future__ import annotations
@@ -55,7 +62,8 @@ def _usage() -> None:
     print(
         "Usage: img_to_vox.py input.png [output.vox]\n"
         "\n"
-        "Optional env overrides: SEED, PIPELINE_TYPE, MATERIAL_MODE, OUT_RES,\n"
+        "Optional env overrides: CONVERT_MODE=glb|direct, SEED, PIPELINE_TYPE,\n"
+        "OUT_RES, COLOR_MODE, VOX_FILL, SURFACE_BAND, MATERIAL_MODE,\n"
         "TRELLIS_MODEL, ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE",
         file=sys.stderr,
     )
@@ -106,6 +114,7 @@ def main() -> int:
         downsample_device=os.environ.get("DOWNSAMPLE_DEVICE"),
         include_palette=True,
         include_preview=True,
+        mode=os.environ.get("CONVERT_MODE", "glb"),
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,7 +148,7 @@ def main() -> int:
         flush=True,
     )
     print(
-        f"wrote {out_path}  bytes={len(result.vox_bytes)}  "
+        f"wrote {out_path}  mode={result.mode}  bytes={len(result.vox_bytes)}  "
         f"roundtrip={'OK' if ok else 'FAIL'}  total={time.time() - t0:.1f}s",
         flush=True,
     )

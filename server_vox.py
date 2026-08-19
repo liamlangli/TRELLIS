@@ -2,21 +2,32 @@
 """
 Persistent HTTP server: load TRELLIS.2 once, convert images to VOX2 on demand.
 
+Default local pipeline is the full path:
+    image -> TRELLIS mesh -> textured GLB -> CuMesh voxelize -> VOX2
+
 Start (project venv, GPU):
-    .venv\\Scripts\\python.exe server_vox.py
+    .venv\Scripts\python.exe server_vox.py
     # or
-    set HOST=0.0.0.0& set PORT=8080& .venv\\Scripts\\python.exe server_vox.py
+    set HOST=0.0.0.0& set PORT=8080& .venv\Scripts\python.exe server_vox.py
+    serve.bat
 
 Endpoints:
-    GET  /health              → JSON status
-    POST /convert             → raw image body OR multipart field "image"
-                              ← application/octet-stream VOX2 bytes
+    GET  /health              -> JSON status
+    POST /convert             -> raw image body OR multipart field "image"
+                              <- application/octet-stream VOX2 bytes
                               headers carry size / solid / timing metadata
-    POST /convert.json        → same input; JSON with base64 vox (+ optional palette/preview)
+    POST /convert.json        -> same input; JSON with base64 vox (+ optional palette/preview)
 
 Query / form fields (all optional):
-    seed, pipeline_type, material_mode, out_res, alpha_threshold,
-    color_axis, include_palette, include_preview
+    mode=glb|direct           default glb (full image->GLB->VOX); direct = old shortcut
+    seed, pipeline_type, out_res,
+    # glb path:
+    decimate_target, texture_size, simplify_target, remesh, remesh_band, remesh_project,
+    vox_fill, surface_band, pad_voxels, chunk, color_mode, simplify_faces, sdf_mode,
+    max_colors, crop, keep_glb,
+    # direct path only:
+    material_mode, alpha_threshold, color_axis, downsample_device,
+    include_palette, include_preview
 """
 
 from __future__ import annotations
@@ -60,7 +71,9 @@ _ensure_venv()
 sys.path.insert(0, str(ROOT))
 from trellis_vox_runtime import TrellisVoxRuntime, bootstrap_env  # noqa: E402
 
-bootstrap_env()
+# Default server path is full image->GLB->VOX, so refuse stubs early.
+_mode = (os.environ.get("CONVERT_MODE", "glb") or "glb").strip().lower()
+bootstrap_env(allow_stubs=_mode in ("direct", "fast", "mesh", "mesh_voxel", "direct_mesh"))
 
 try:
     from flask import Flask, Request, jsonify, request, Response
@@ -103,7 +116,19 @@ def _pick(req: Request, *names: str, default=None):
 def _parse_convert_options(req: Request) -> dict:
     out_res = _pick(req, "out_res", "outRes", default=os.environ.get("OUT_RES", "256"))
     seed = _pick(req, "seed", default=os.environ.get("SEED", "0"))
-    return {
+    mode = str(
+        _pick(
+            req,
+            "mode",
+            "convert_mode",
+            "convertMode",
+            default=os.environ.get("CONVERT_MODE", "glb"),
+        )
+    ).lower()
+    remesh_raw = _pick(req, "remesh", default=None)
+    vox_fill_raw = _pick(req, "vox_fill", "voxFill", "fill", default=None)
+    crop_raw = _pick(req, "crop", default=None)
+    opts = {
         "seed": int(seed),
         "pipeline_type": str(
             _pick(req, "pipeline_type", "pipelineType", default=os.environ.get("PIPELINE_TYPE", "512"))
@@ -121,7 +146,48 @@ def _parse_convert_options(req: Request) -> dict:
         "downsample_device": _pick(req, "downsample_device", "downsampleDevice", default=None),
         "include_palette": _as_bool(_pick(req, "include_palette", "includePalette"), False),
         "include_preview": _as_bool(_pick(req, "include_preview", "includePreview"), False),
+        "mode": mode,
+        "keep_glb": _as_bool(_pick(req, "keep_glb", "keepGlb", "include_glb", "includeGlb"), False),
+        "decimate_target": _pick(req, "decimate_target", "decimateTarget", default=None),
+        "texture_size": _pick(req, "texture_size", "textureSize", default=None),
+        "simplify_target": _pick(req, "simplify_target", "simplifyTarget", default=None),
+        "remesh_band": _pick(req, "remesh_band", "remeshBand", default=None),
+        "remesh_project": _pick(req, "remesh_project", "remeshProject", default=None),
+        "surface_band": _pick(req, "surface_band", "surfaceBand", default=None),
+        "pad_voxels": _pick(req, "pad_voxels", "padVoxels", default=None),
+        "chunk": _pick(req, "chunk", default=None),
+        "color_mode": _pick(req, "color_mode", "colorMode", default=None),
+        "simplify_faces": _pick(req, "simplify_faces", "simplifyFaces", default=None),
+        "sdf_mode": _pick(req, "sdf_mode", "sdfMode", default=None),
+        "max_colors": _pick(req, "max_colors", "maxColors", default=None),
+        "device": _pick(req, "device", default=None),
     }
+    if remesh_raw is not None:
+        opts["remesh"] = _as_bool(remesh_raw, False)
+    if vox_fill_raw is not None:
+        opts["vox_fill"] = _as_bool(vox_fill_raw, True)
+    if crop_raw is not None:
+        opts["crop"] = _as_bool(crop_raw, True)
+
+    for key, caster in (
+        ("decimate_target", int),
+        ("texture_size", int),
+        ("simplify_target", int),
+        ("remesh_band", float),
+        ("remesh_project", float),
+        ("surface_band", float),
+        ("pad_voxels", int),
+        ("chunk", int),
+        ("simplify_faces", int),
+        ("max_colors", int),
+    ):
+        if opts.get(key) is not None:
+            opts[key] = caster(opts[key])
+    if opts.get("color_mode") is not None:
+        opts["color_mode"] = str(opts["color_mode"]).lower()
+    if opts.get("sdf_mode") is not None:
+        opts["sdf_mode"] = str(opts["sdf_mode"])
+    return opts
 
 
 def _read_image_bytes(req: Request) -> bytes:
@@ -166,6 +232,7 @@ def _result_headers(result) -> dict:
         "X-Pipeline-Type": result.pipeline_type,
         "X-Material-Mode": result.material_mode,
         "X-Out-Res": str(result.out_res),
+        "X-Convert-Mode": getattr(result, "mode", "glb"),
         "X-Model": RUNTIME.model_id,
         "Cache-Control": "no-store",
     }
@@ -181,9 +248,11 @@ def health():
             "model": RUNTIME.model_id,
             "device": RUNTIME.device_name,
             "uptime_s": round(time.time() - STARTED_AT, 1),
+            "convert_mode_default": os.environ.get("CONVERT_MODE", "glb"),
+            "pipeline": "image -> GLB -> VOX (mode=glb) | image -> MeshWithVoxel -> VOX (mode=direct)",
             "endpoints": {
                 "GET /health": "status",
-                "POST /convert": "image bytes → VOX2 bytes",
+                "POST /convert": "image bytes -> VOX2 bytes (default full img->glb->vox)",
                 "POST /convert.json": "image → JSON{vox_base64,...}",
             },
         }
@@ -248,6 +317,9 @@ def convert_json():
         body["palette_png_base64"] = base64.b64encode(result.palette_png).decode("ascii")
     if result.preview_png is not None:
         body["preview_png_base64"] = base64.b64encode(result.preview_png).decode("ascii")
+    if getattr(result, "glb_bytes", None):
+        body["glb_base64"] = base64.b64encode(result.glb_bytes).decode("ascii")
+        body["glb_bytes"] = len(result.glb_bytes)
     resp = jsonify(body)
     for k, v in _result_headers(result).items():
         resp.headers[k] = v
@@ -255,7 +327,7 @@ def convert_json():
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="TRELLIS.2 image→VOX HTTP server")
+    parser = argparse.ArgumentParser(description="TRELLIS.2 image->GLB->VOX HTTP server")
     parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
     parser.add_argument("--model", default=os.environ.get("TRELLIS_MODEL", "microsoft/TRELLIS.2-4B"))
@@ -267,6 +339,7 @@ def main() -> int:
         help="Load weights before accepting traffic (default on). Set PRELOAD=0 to defer.",
     )
     args = parser.parse_args()
+    os.environ.setdefault("CONVERT_MODE", "glb")
 
     if args.preload:
         print(f"[server] preloading model={args.model} …", flush=True)
@@ -282,7 +355,11 @@ def main() -> int:
         print("[server] loading model in background; /health will report ready=false until done", flush=True)
 
     print(f"[server] listening on http://{args.host}:{args.port}", flush=True)
-    print("[server] POST /convert  (raw image or multipart) → VOX2", flush=True)
+    print(
+        f"[server] POST /convert  image -> VOX2  default mode={os.environ.get('CONVERT_MODE', 'glb')} "
+        "(full image->GLB->VOX; pass mode=direct for old shortcut)",
+        flush=True,
+    )
     # threaded=False: GPU conversion already serialized by runtime lock;
     # keep Flask simple (one waiters queue). Use waitress/gunicorn for prod if needed.
     APP.run(host=args.host, port=args.port, threaded=True, use_reloader=False)

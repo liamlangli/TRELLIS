@@ -20,11 +20,25 @@ if "%~2"=="" (
 )
 popd >nul
 
+REM Optional 3rd arg: max VOX resolution (longest-axis voxels). Overrides OUT_RES env.
+if not "%~3"=="" (
+  set "OUT_RES=%~3"
+)
+
 if not exist "!IN_IMG!" (
   echo [ERROR] Image not found: %~1
   echo         resolved: !IN_IMG!
   echo         cwd: %CALLER_CWD%
   exit /b 1
+)
+
+if defined OUT_RES (
+  echo !OUT_RES!| findstr /R /C:"^[1-9][0-9]*$" >nul
+  if errorlevel 1 (
+    echo [ERROR] Invalid max resolution: !OUT_RES!
+    echo         Expected a positive integer, e.g. 128 or 256.
+    exit /b 1
+  )
 )
 
 if not defined VOX_URL (
@@ -34,6 +48,8 @@ if not defined VOX_URL (
 )
 
 set "QUERY="
+if defined CONVERT_MODE set "QUERY=!QUERY!&mode=!CONVERT_MODE!"
+if defined MODE set "QUERY=!QUERY!&mode=!MODE!"
 if defined SEED set "QUERY=!QUERY!&seed=!SEED!"
 if defined PIPELINE_TYPE set "QUERY=!QUERY!&pipeline_type=!PIPELINE_TYPE!"
 if defined MATERIAL_MODE set "QUERY=!QUERY!&material_mode=!MATERIAL_MODE!"
@@ -41,6 +57,12 @@ if defined OUT_RES set "QUERY=!QUERY!&out_res=!OUT_RES!"
 if defined ALPHA_THR set "QUERY=!QUERY!&alpha_threshold=!ALPHA_THR!"
 if defined COLOR_AXIS set "QUERY=!QUERY!&color_axis=!COLOR_AXIS!"
 if defined DOWNSAMPLE_DEVICE set "QUERY=!QUERY!&downsample_device=!DOWNSAMPLE_DEVICE!"
+if defined COLOR_MODE set "QUERY=!QUERY!&color_mode=!COLOR_MODE!"
+if defined VOX_FILL set "QUERY=!QUERY!&vox_fill=!VOX_FILL!"
+if defined SURFACE_BAND set "QUERY=!QUERY!&surface_band=!SURFACE_BAND!"
+if defined DECIMATE_TARGET set "QUERY=!QUERY!&decimate_target=!DECIMATE_TARGET!"
+if defined TEXTURE_SIZE set "QUERY=!QUERY!&texture_size=!TEXTURE_SIZE!"
+if defined KEEP_GLB set "QUERY=!QUERY!&keep_glb=!KEEP_GLB!"
 
 if defined QUERY (
   set "CONVERT_URL=!VOX_URL!/convert?!QUERY:~1!"
@@ -52,6 +74,11 @@ echo Converting via HTTP:
 echo   server: !VOX_URL!
 echo   image:  !IN_IMG!
 echo   vox:    !OUT_VOX!
+if defined OUT_RES (
+  echo   out_res:!OUT_RES!
+) else (
+  echo   out_res:^(server default^)
+)
 echo.
 
 where curl >nul 2>nul
@@ -104,11 +131,13 @@ echo OK wrote !OUT_VOX!  bytes=!FINAL_SIZE!
 exit /b 0
 
 :usage
-echo Usage: tovox.bat input.png [output.vox]
+echo Usage: tovox.bat input.png [output.vox] [max_res]
 echo.
 echo Examples:
+echo   tovox.bat a.png
 echo   tovox.bat a.png b.vox
-echo   tovox.bat .\photos\a.png out\b.vox
+echo   tovox.bat a.png b.vox 128
+echo   tovox.bat .\photos\a.png out\b.vox 256
 echo.
 echo Paths are resolved from the current working directory.
 echo Converts via HTTP against a running server_vox instance.
@@ -116,8 +145,12 @@ echo Start the server first:
 echo   serve.bat
 echo.
 echo If output is omitted, writes ^<input^>.vox next to the image.
+echo max_res is the longest-axis voxel resolution (query out_res).
+echo It overrides OUT_RES env for this call when provided.
 echo Server URL: set VOX_URL=http://127.0.0.1:8080
 echo        or: set VOX_HOST / VOX_PORT
-echo Optional convert overrides: SEED, PIPELINE_TYPE, MATERIAL_MODE, OUT_RES,
-echo ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE
+echo Optional convert overrides: CONVERT_MODE/MODE=glb|direct, SEED, PIPELINE_TYPE,
+echo OUT_RES, COLOR_MODE, VOX_FILL, SURFACE_BAND, DECIMATE_TARGET, TEXTURE_SIZE,
+echo KEEP_GLB, MATERIAL_MODE, ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE
+echo Default server mode is full image-^>GLB-^>VOX.
 exit /b 1

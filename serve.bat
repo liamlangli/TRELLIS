@@ -10,11 +10,13 @@ if not exist ".venv\Scripts\python.exe" (
 
 if not defined HOST set "HOST=0.0.0.0"
 if not defined PORT set "PORT=8080"
+if not defined CONVERT_MODE set "CONVERT_MODE=glb"
 
 echo Starting server_vox with project venv...
 echo   python: %CD%\.venv\Scripts\python.exe
 echo   host:   %HOST%
 echo   port:   %PORT%
+echo   mode:   %CONVERT_MODE%  (glb = full image-^>GLB-^>VOX)
 echo.
 
 ".venv\Scripts\python.exe" "%~dp0server_vox.py" %*

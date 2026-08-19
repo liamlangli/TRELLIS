@@ -1,4 +1,9 @@
-"""Shared TRELLIS.2 image→VOX runtime (load once, convert many)."""
+"""Shared TRELLIS.2 image→VOX runtime (load once, convert many).
+
+Default convert path is the full local pipeline:
+  image → TRELLIS mesh → textured GLB → CuMesh voxelize → VOX2
+Optional mode="direct" keeps the old MeshWithVoxel shortcut.
+"""
 
 from __future__ import annotations
 
@@ -140,6 +145,8 @@ class ConvertResult:
     elapsed_s: float
     palette_png: Optional[bytes] = None
     preview_png: Optional[bytes] = None
+    mode: str = "glb"
+    glb_bytes: Optional[bytes] = None
 
 
 class TrellisVoxRuntime:
@@ -163,8 +170,23 @@ class TrellisVoxRuntime:
         dino_repo: Optional[str] = None,
         rembg_name: Optional[str] = None,
         low_vram: bool = False,
+        require_full_stack: Optional[bool] = None,
     ) -> None:
-        bootstrap_env()
+        # GLB path needs real o_voxel/cumesh/nvdiffrast. Default on unless CONVERT_MODE=direct.
+        if require_full_stack is None:
+            mode = (os.environ.get("CONVERT_MODE", "glb") or "glb").strip().lower()
+            require_full_stack = mode not in ("direct", "fast", "mesh", "mesh_voxel", "direct_mesh")
+        bootstrap_env(allow_stubs=not require_full_stack)
+        if require_full_stack:
+            # Ensure residual /stubs path cannot shadow installed packages.
+            sys.path[:] = [
+                p
+                for p in sys.path
+                if Path(p).resolve().name.lower() != "stubs"
+                and "/stubs/" not in Path(p).as_posix().lower()
+                and not Path(p).as_posix().lower().endswith("/stubs")
+            ]
+
         import torch
         from transformers import DINOv3ViTModel
         from torchvision import transforms
@@ -187,7 +209,7 @@ class TrellisVoxRuntime:
             flush=True,
         )
         t0 = time.time()
-        print(f"[runtime] loading DINOv3 from {dino_repo} …", flush=True)
+        print(f"[runtime] loading DINOv3 from {dino_repo} ...", flush=True)
         dino = DinoV3FeatureExtractor.__new__(DinoV3FeatureExtractor)
         dino.model_name = dino_repo
         dino.model = DINOv3ViTModel.from_pretrained(dino_repo)
@@ -197,7 +219,7 @@ class TrellisVoxRuntime:
             [transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
         )
 
-        print(f"[runtime] loading rembg {rembg_name} …", flush=True)
+        print(f"[runtime] loading rembg {rembg_name} ...", flush=True)
         rembg = rembg_mod.BiRefNet(model_name=rembg_name)
         rembg.model = rembg.model.float()
 
@@ -209,7 +231,7 @@ class TrellisVoxRuntime:
         ife.DinoV3FeatureExtractor = _Dummy
         rbg.BiRefNet = _Dummy
         try:
-            print(f"[runtime] loading TRELLIS pipeline {model} …", flush=True)
+            print(f"[runtime] loading TRELLIS pipeline {model} ...", flush=True)
             pipeline = Trellis2ImageTo3DPipeline.from_pretrained(model)
         finally:
             ife.DinoV3FeatureExtractor = _orig_dino
@@ -335,10 +357,37 @@ class TrellisVoxRuntime:
         downsample_device: Optional[str] = None,
         include_palette: bool = False,
         include_preview: bool = False,
+        mode: Optional[str] = None,
+        keep_glb: bool = False,
+        decimate_target: Optional[int] = None,
+        texture_size: Optional[int] = None,
+        simplify_target: Optional[int] = None,
+        remesh: Optional[bool] = None,
+        remesh_band: Optional[float] = None,
+        remesh_project: Optional[float] = None,
+        vox_fill: Optional[bool] = None,
+        surface_band: Optional[float] = None,
+        pad_voxels: Optional[int] = None,
+        chunk: Optional[int] = None,
+        color_mode: Optional[str] = None,
+        simplify_faces: Optional[int] = None,
+        sdf_mode: Optional[str] = None,
+        max_colors: Optional[int] = None,
+        crop: Optional[bool] = None,
+        device: Optional[str] = None,
     ) -> ConvertResult:
+        """image -> VOX.
+
+        Default mode is the full local pipeline:
+          preprocess -> TRELLIS mesh -> simplify -> o_voxel.to_glb -> CuMesh voxelize -> VOX2
+
+        mode="direct" keeps the old shortcut that samples TRELLIS MeshWithVoxel
+        occupancy without baking a textured GLB.
+        """
         if not self._ready or self.pipeline is None:
             raise RuntimeError("runtime not loaded; call load() first")
 
+        import tempfile
         import torch
         import vox_io
 
@@ -358,10 +407,21 @@ class TrellisVoxRuntime:
         pipeline_type = pipeline_type or "512"
         out_res = int(out_res)
         seed = int(seed)
+        mode = (mode or os.environ.get("CONVERT_MODE", "glb") or "glb").strip().lower()
+        if mode in ("full", "img_glb_vox", "image_glb_vox", "glb_path"):
+            mode = "glb"
+        if mode in ("fast", "mesh", "mesh_voxel", "direct_mesh"):
+            mode = "direct"
+        if mode not in ("glb", "direct"):
+            raise ValueError(f"unsupported convert mode: {mode!r} (use 'glb' or 'direct')")
 
         with self._lock:
             t0 = time.time()
             pre_image = self.pipeline.preprocess_image(pil)
+            print(
+                f"[runtime] convert mode={mode} seed={seed} pipeline={pipeline_type} out_res={out_res}",
+                flush=True,
+            )
             meshes = self.pipeline.run(
                 pre_image,
                 seed=seed,
@@ -369,30 +429,205 @@ class TrellisVoxRuntime:
                 pipeline_type=pipeline_type,
             )
             mesh = meshes[0]
-            grid, palette = vox_io.grid_from_mesh_with_voxel(
-                mesh,
-                material_mode=material_mode,
-                alpha_threshold=float(alpha_threshold),
-                max_colors=255,
-                crop=True,
-                solid_material=1,
-                # Always pass preprocessed image so color/auto can fall back to projection.
-                color_image=pre_image,
-                color_axis=color_axis or "auto",
-            )
-            native_size = (grid.size_x, grid.size_y, grid.size_z)
-            native_solid = grid.count_solid()
-            if out_res > 0 and max(grid.size_x, grid.size_y, grid.size_z) > out_res:
-                ds_dev = downsample_device if downsample_device is not None else os.environ.get(
-                    "DOWNSAMPLE_DEVICE"
-                )
-                grid = vox_io.downsample_grid(grid, target_max=out_res, device=ds_dev)
 
-            vox_bytes = vox_io.encode(
-                vox_io.swap_yz(grid),
-                use_zstd=True,
-                palette=palette,
-            )
+            if mode == "direct":
+                grid, palette = vox_io.grid_from_mesh_with_voxel(
+                    mesh,
+                    material_mode=material_mode,
+                    alpha_threshold=float(alpha_threshold),
+                    max_colors=int(max_colors or os.environ.get("MAX_COLORS", "255")),
+                    crop=True if crop is None else bool(crop),
+                    solid_material=1,
+                    color_image=pre_image,
+                    color_axis=color_axis or "auto",
+                )
+                native_size = (grid.size_x, grid.size_y, grid.size_z)
+                native_solid = grid.count_solid()
+                if out_res > 0 and max(grid.size_x, grid.size_y, grid.size_z) > out_res:
+                    ds_dev = (
+                        downsample_device
+                        if downsample_device is not None
+                        else os.environ.get("DOWNSAMPLE_DEVICE")
+                    )
+                    grid = vox_io.downsample_grid(grid, target_max=out_res, device=ds_dev)
+                vox_bytes = vox_io.encode(
+                    vox_io.swap_yz(grid),
+                    use_zstd=True,
+                    palette=palette,
+                )
+                glb_bytes = None
+            else:
+                # Full path: mesh -> textured GLB -> CuMesh BVH voxelizer.
+                import o_voxel
+                from glb_to_vox import convert_glb_file
+
+                decimate = int(
+                    decimate_target
+                    if decimate_target is not None
+                    else os.environ.get("DECIMATE_TARGET", "1000000")
+                )
+                tex_size = int(
+                    texture_size if texture_size is not None else os.environ.get("TEXTURE_SIZE", "2048")
+                )
+                simp_target = int(
+                    simplify_target
+                    if simplify_target is not None
+                    else os.environ.get("SIMPLIFY_TARGET", "16777216")
+                )
+                do_remesh = (
+                    bool(remesh)
+                    if remesh is not None
+                    else os.environ.get("REMESH", "0") != "0"
+                )
+                r_band = float(
+                    remesh_band if remesh_band is not None else os.environ.get("REMESH_BAND", "1")
+                )
+                r_proj = float(
+                    remesh_project
+                    if remesh_project is not None
+                    else os.environ.get("REMESH_PROJECT", "0")
+                )
+
+                print(
+                    f"[runtime] GLB postprocess simplify={simp_target} decimate={decimate} "
+                    f"texture={tex_size} remesh={do_remesh}",
+                    flush=True,
+                )
+                try:
+                    bc = mesh.attrs[:, mesh.layout["base_color"]].detach().float()
+                    print(
+                        f"[runtime] base_color mean={bc.mean(0).tolist()} std={bc.std(0).tolist()}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[runtime] base_color stats failed: {e}", flush=True)
+
+                mesh.simplify(simp_target)
+                glb = o_voxel.postprocess.to_glb(
+                    vertices=mesh.vertices,
+                    faces=mesh.faces,
+                    attr_volume=mesh.attrs,
+                    coords=mesh.coords,
+                    attr_layout=mesh.layout,
+                    voxel_size=mesh.voxel_size,
+                    aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+                    decimation_target=decimate,
+                    texture_size=tex_size,
+                    remesh=do_remesh,
+                    remesh_band=r_band,
+                    remesh_project=r_proj,
+                    verbose=True,
+                )
+
+                fill = (
+                    bool(vox_fill)
+                    if vox_fill is not None
+                    else os.environ.get("VOX_FILL", "1") != "0"
+                )
+                s_band = float(
+                    surface_band if surface_band is not None else os.environ.get("SURFACE_BAND", "0.75")
+                )
+                pad = int(pad_voxels if pad_voxels is not None else os.environ.get("PAD_VOXELS", "1"))
+                chunk_n = int(chunk if chunk is not None else os.environ.get("CHUNK", "1500000"))
+                c_mode = (
+                    color_mode if color_mode is not None else os.environ.get("COLOR_MODE", "texture")
+                ).lower()
+                simp_faces = int(
+                    simplify_faces
+                    if simplify_faces is not None
+                    else os.environ.get("SIMPLIFY_FACES", "0")
+                )
+                sdf = sdf_mode if sdf_mode is not None else os.environ.get("SDF_MODE", "raystab")
+                mcol = int(max_colors if max_colors is not None else os.environ.get("MAX_COLORS", "255"))
+                do_crop = True if crop is None else bool(crop)
+                dev = device if device is not None else os.environ.get("DEVICE", "cuda")
+
+                tmp_dir = Path(tempfile.mkdtemp(prefix="trellis_img_glb_vox_"))
+                glb_path = tmp_dir / "sample.glb"
+                try:
+                    glb.export(str(glb_path), extension_webp=True)
+                    glb_bytes = glb_path.read_bytes() if keep_glb else None
+                    keep_dir = os.environ.get("TRELLIS_KEEP_GLB_DIR") or os.environ.get("KEEP_GLB_DIR")
+                    if keep_dir or keep_glb:
+                        try:
+                            dest_dir = Path(keep_dir) if keep_dir else Path(tempfile.gettempdir())
+                            dest_dir.mkdir(parents=True, exist_ok=True)
+                            dest = dest_dir / f"trellis_{int(time.time())}.glb"
+                            dest.write_bytes(glb_path.read_bytes())
+                            print(f"[runtime] kept intermediate GLB at {dest}", flush=True)
+                            if keep_glb and glb_bytes is None:
+                                glb_bytes = dest.read_bytes()
+                        except Exception as e:
+                            print(f"[runtime] keep GLB failed: {e}", flush=True)
+                    print(
+                        f"[runtime] GLB baked bytes={glb_path.stat().st_size} -> voxelize out_res={out_res}",
+                        flush=True,
+                    )
+                    bands = [s_band]
+                    for extra in (1.5, 2.5, 4.0):
+                        if extra not in bands:
+                            bands.append(extra)
+                    last_err = None
+                    palette = None
+                    stats = None
+                    grid = None
+                    for bi, band_try in enumerate(bands):
+                        try:
+                            print(
+                                f"[runtime] voxelize try {bi+1}/{len(bands)} band={band_try} fill={fill}",
+                                flush=True,
+                            )
+                            _, palette, stats, grid = convert_glb_file(
+                                glb_path,
+                                out_res=out_res,
+                                fill=fill,
+                                surface_band=band_try,
+                                pad_voxels=pad,
+                                chunk=chunk_n,
+                                color_mode=c_mode,
+                                simplify_faces=simp_faces,
+                                device=dev,
+                                sdf_mode=sdf,
+                                crop=do_crop,
+                                max_colors=mcol,
+                            )
+                            last_err = None
+                            s_band = float(band_try)
+                            break
+                        except Exception as e:
+                            last_err = e
+                            print(f"[runtime] voxelize try failed: {type(e).__name__}: {e}", flush=True)
+                    if last_err is not None or grid is None:
+                        # Keep GLB for inspection when voxelization fails.
+                        keep_path = Path(tempfile.gettempdir()) / f"trellis_fail_{int(time.time())}.glb"
+                        try:
+                            keep_path.write_bytes(glb_path.read_bytes())
+                            print(f"[runtime] preserved failed GLB at {keep_path}", flush=True)
+                        except Exception as e:
+                            print(f"[runtime] could not preserve GLB: {e}", flush=True)
+                        raise RuntimeError(
+                            f"GLB voxelization failed after retries: {last_err}"
+                        ) from last_err
+                    native_size = tuple(stats.get("size", (grid.size_x, grid.size_y, grid.size_z)))
+                    native_solid = int(stats.get("solid", grid.count_solid()))
+                    # material_mode is not used on the GLB path; report color_mode instead.
+                    material_mode = c_mode
+                    # GLB/glTF is Y-up already (no TRELLIS Z-up swap).
+                    # Orient so default +Z camera matches source image: swap X/Z then flip X.
+                    grid = vox_io.orient_glb_to_vox(grid)
+                    vox_bytes = vox_io.encode(
+                        grid,
+                        use_zstd=True,
+                        palette=palette,
+                    )
+                finally:
+                    try:
+                        if glb_path.is_file():
+                            glb_path.unlink()
+                        tmp_dir.rmdir()
+                    except OSError:
+                        pass
+
             palette_png = None
             if include_palette and palette is not None:
                 buf = io.BytesIO()
@@ -402,13 +637,48 @@ class TrellisVoxRuntime:
                 palette_png = buf.getvalue()
             preview_png = self._preview_png(grid, palette) if include_preview else None
 
-            # free some activation memory between requests
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+            # Guard against collapsed / paper-thin GLB voxelizations.
+            # Prefer falling back to MeshWithVoxel direct path over returning a paper sheet.
+            if mode == "glb":
+                dims = sorted([int(grid.size_x), int(grid.size_y), int(grid.size_z)])
+                if dims[0] <= 4 and dims[2] >= 32:
+                    print(
+                        f"[runtime] GLB voxelization collapsed to {grid.size_x}x{grid.size_y}x{grid.size_z}; "
+                        "falling back to direct MeshWithVoxel path",
+                        flush=True,
+                    )
+                    grid, palette = vox_io.grid_from_mesh_with_voxel(
+                        mesh,
+                        material_mode=(os.environ.get("MATERIAL_MODE", "image") or "image").lower(),
+                        alpha_threshold=float(alpha_threshold),
+                        max_colors=int(max_colors or os.environ.get("MAX_COLORS", "255")),
+                        crop=True if crop is None else bool(crop),
+                        solid_material=1,
+                        color_image=pre_image,
+                        color_axis=color_axis or "auto",
+                    )
+                    native_size = (grid.size_x, grid.size_y, grid.size_z)
+                    native_solid = grid.count_solid()
+                    if out_res > 0 and max(grid.size_x, grid.size_y, grid.size_z) > out_res:
+                        ds_dev = (
+                            downsample_device
+                            if downsample_device is not None
+                            else os.environ.get("DOWNSAMPLE_DEVICE")
+                        )
+                        grid = vox_io.downsample_grid(grid, target_max=out_res, device=ds_dev)
+                    vox_bytes = vox_io.encode(
+                        vox_io.swap_yz(grid),
+                        use_zstd=True,
+                        palette=palette,
+                    )
+                    material_mode = (os.environ.get("MATERIAL_MODE", "image") or "image").lower()
+                    mode = "glb+direct_fallback"
             elapsed = time.time() - t0
             print(
-                f"[runtime] convert done {grid.size_x}x{grid.size_y}x{grid.size_z} "
+                f"[runtime] convert done mode={mode} {grid.size_x}x{grid.size_y}x{grid.size_z} "
                 f"solid={grid.count_solid()} in {elapsed:.1f}s",
                 flush=True,
             )
@@ -427,4 +697,6 @@ class TrellisVoxRuntime:
                 elapsed_s=elapsed,
                 palette_png=palette_png,
                 preview_png=preview_png,
+                mode=mode,
+                glb_bytes=glb_bytes,
             )

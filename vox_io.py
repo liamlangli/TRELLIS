@@ -824,9 +824,35 @@ def swap_yz(grid: VoxelGrid) -> VoxelGrid:
     return VoxelGrid(np.ascontiguousarray(np.transpose(grid.data, (1, 0, 2))))
 
 
+def swap_xz(grid: VoxelGrid) -> VoxelGrid:
+    """Swap X and Z. Data layout stays (Z,Y,X).
+
+    Maps voxel coords ``(x, y, z) → (z, y, x)``. Useful so a mesh that faced
+    +X/±Z in glTF is reoriented so the default +Z camera sees the front.
+    Self-inverse: calling twice restores the original.
+    """
+    # data axes: 0=Z, 1=Y, 2=X → (X, Y, Z); sizes become (sz, sy, sx)
+    return VoxelGrid(np.ascontiguousarray(np.transpose(grid.data, (2, 1, 0))))
+
+
 # back-compat alias (older wrong mapping)
 def swap_xy(grid: VoxelGrid) -> VoxelGrid:
     return VoxelGrid(np.ascontiguousarray(np.swapaxes(grid.data, 1, 2)))
+
+
+
+def flip_x(grid: VoxelGrid) -> VoxelGrid:
+    """Mirror along X (right-left). Data layout stays (Z,Y,X)."""
+    return VoxelGrid(np.ascontiguousarray(grid.data[:, :, ::-1]))
+
+
+def orient_glb_to_vox(grid: VoxelGrid) -> VoxelGrid:
+    """glTF Y-up mesh grid -> VOX axes for default +Z camera ~ source image.
+
+    1) swap X/Z so depth becomes Z and front silhouette is XY
+    2) flip X so left-right matches the source image (not mirrored)
+    """
+    return flip_x(swap_xz(grid))
 
 
 def write(
@@ -1602,6 +1628,9 @@ __all__ = [
     "read_ex",
     "write",
     "swap_yz",
+    "swap_xz",
+    "flip_x",
+    "orient_glb_to_vox",
     "swap_xy",
     "build_palette_table",
     "encode_palette_prefix",
