@@ -56,8 +56,8 @@ def _usage() -> None:
         "\n"
         "Env overrides:\n"
         "  SEED, PIPELINE_TYPE, TRELLIS_MODEL, LOW_VRAM,\n"
-        "  DECIMATE_TARGET (default 1000000),\n"
-        "  TEXTURE_SIZE    (default 2048),\n"
+        "  DECIMATE_TARGET (default 150000; VOX-friendly),\n"
+        "  TEXTURE_SIZE    (default 1024; VOX-friendly),\n"
         "  SIMPLIFY_TARGET (default 16777216 nvdiffrast limit),\n"
         "  REMESH=0|1 (default 0; 1 is VRAM-heavy), REMESH_BAND, REMESH_PROJECT\n",
         file=sys.stderr,
@@ -130,8 +130,8 @@ def main() -> int:
     pipeline_type = os.environ.get("PIPELINE_TYPE", "512")
     model = os.environ.get("TRELLIS_MODEL", "microsoft/TRELLIS.2-4B")
     low_vram = os.environ.get("LOW_VRAM", "0") == "1"
-    decimate = int(os.environ.get("DECIMATE_TARGET", "1000000"))
-    tex_size = int(os.environ.get("TEXTURE_SIZE", "2048"))
+    decimate = int(os.environ.get("DECIMATE_TARGET", "150000"))
+    tex_size = int(os.environ.get("TEXTURE_SIZE", "1024"))
     simplify_target = int(os.environ.get("SIMPLIFY_TARGET", "16777216"))
     remesh = os.environ.get("REMESH", "0") != "0"
     remesh_band = float(os.environ.get("REMESH_BAND", "1"))

@@ -150,7 +150,7 @@ echo It overrides OUT_RES env for this call when provided.
 echo Server URL: set VOX_URL=http://127.0.0.1:8080
 echo        or: set VOX_HOST / VOX_PORT
 echo Optional convert overrides: CONVERT_MODE/MODE=glb|direct, SEED, PIPELINE_TYPE,
-echo OUT_RES, COLOR_MODE, VOX_FILL, SURFACE_BAND, DECIMATE_TARGET, TEXTURE_SIZE,
+echo OUT_RES, COLOR_MODE, VOX_FILL, SURFACE_BAND, DECIMATE_TARGET(default 150000), TEXTURE_SIZE(default 1024),
 echo KEEP_GLB, MATERIAL_MODE, ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE
 echo Default server mode is full image-^>GLB-^>VOX.
 exit /b 1

@@ -56,6 +56,6 @@ echo Paths are resolved from the current working directory.
 echo.
 echo Optional env:
 echo   SEED, PIPELINE_TYPE, TRELLIS_MODEL, LOW_VRAM
-echo   DECIMATE_TARGET, TEXTURE_SIZE, SIMPLIFY_TARGET
+echo   DECIMATE_TARGET (default 150000), TEXTURE_SIZE (default 1024), SIMPLIFY_TARGET
 echo   REMESH, REMESH_BAND, REMESH_PROJECT
 exit /b 1

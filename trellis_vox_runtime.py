@@ -464,10 +464,10 @@ class TrellisVoxRuntime:
                 decimate = int(
                     decimate_target
                     if decimate_target is not None
-                    else os.environ.get("DECIMATE_TARGET", "1000000")
+                    else os.environ.get("DECIMATE_TARGET", "150000")
                 )
                 tex_size = int(
-                    texture_size if texture_size is not None else os.environ.get("TEXTURE_SIZE", "2048")
+                    texture_size if texture_size is not None else os.environ.get("TEXTURE_SIZE", "1024")
                 )
                 simp_target = int(
                     simplify_target
