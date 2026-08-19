@@ -19,7 +19,7 @@ Endpoints:
     POST /convert.json        -> same input; JSON with base64 vox (+ optional palette/preview)
 
 Query / form fields (all optional):
-    mode=glb|direct           default glb (full image->GLB->VOX); direct = old shortcut
+    mode=glb|direct           default from CONVERT_MODE env (direct=TRELLIS voxels; glb=bake path)
     seed, pipeline_type, out_res,
     # glb path:
     decimate_target, texture_size, simplify_target, remesh, remesh_band, remesh_project,
@@ -72,7 +72,7 @@ sys.path.insert(0, str(ROOT))
 from trellis_vox_runtime import TrellisVoxRuntime, bootstrap_env  # noqa: E402
 
 # Default server path is full image->GLB->VOX, so refuse stubs early.
-_mode = (os.environ.get("CONVERT_MODE", "glb") or "glb").strip().lower()
+_mode = (os.environ.get("CONVERT_MODE", "direct") or "direct").strip().lower()
 bootstrap_env(allow_stubs=_mode in ("direct", "fast", "mesh", "mesh_voxel", "direct_mesh"))
 
 try:
@@ -89,6 +89,36 @@ RUNTIME = TrellisVoxRuntime()
 APP = Flask(__name__)
 APP.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "32")) * 1024 * 1024
 STARTED_AT = time.time()
+
+
+def _normalize_convert_mode(mode: str | None) -> str:
+    m = (mode or os.environ.get("CONVERT_MODE", "direct") or "direct").strip().lower()
+    if m in ("full", "img_glb_vox", "image_glb_vox", "glb_path"):
+        return "glb"
+    if m in ("fast", "mesh", "mesh_voxel", "direct_mesh"):
+        return "direct"
+    if m not in ("glb", "direct"):
+        return "glb"
+    return m
+
+
+def _pipeline_flow_text(mode: str | None = None) -> str:
+    m = _normalize_convert_mode(mode)
+    if m == "direct":
+        mm = (os.environ.get("MATERIAL_MODE", "color") or "color").strip().lower()
+        return (
+            "image -> TRELLIS MeshWithVoxel -> quantize "
+            f"(material_mode={mm}) -> VOX2"
+        )
+    photo = os.environ.get("PHOTO_COLOR", "1") != "0"
+    cm = (os.environ.get("COLOR_MODE", "texture") or "texture").strip().lower()
+    if photo and cm not in ("solid",):
+        return (
+            "image -> TRELLIS mesh -> bake GLB -> voxelize "
+            f"(color_mode={cm}) -> photo-recolor -> VOX2"
+        )
+    return f"image -> TRELLIS mesh -> bake GLB -> voxelize (color_mode={cm}) -> VOX2"
+
 
 
 def _as_bool(v, default: bool = False) -> bool:
@@ -122,7 +152,7 @@ def _parse_convert_options(req: Request) -> dict:
             "mode",
             "convert_mode",
             "convertMode",
-            default=os.environ.get("CONVERT_MODE", "glb"),
+            default=os.environ.get("CONVERT_MODE", "direct"),
         )
     ).lower()
     remesh_raw = _pick(req, "remesh", default=None)
@@ -134,7 +164,7 @@ def _parse_convert_options(req: Request) -> dict:
             _pick(req, "pipeline_type", "pipelineType", default=os.environ.get("PIPELINE_TYPE", "512"))
         ),
         "material_mode": str(
-            _pick(req, "material_mode", "materialMode", default=os.environ.get("MATERIAL_MODE", "image"))
+            _pick(req, "material_mode", "materialMode", default=os.environ.get("MATERIAL_MODE", "color"))
         ).lower(),
         "out_res": int(out_res),
         "alpha_threshold": float(
@@ -248,8 +278,12 @@ def health():
             "model": RUNTIME.model_id,
             "device": RUNTIME.device_name,
             "uptime_s": round(time.time() - STARTED_AT, 1),
-            "convert_mode_default": os.environ.get("CONVERT_MODE", "glb"),
-            "pipeline": "image -> GLB -> VOX (mode=glb) | image -> MeshWithVoxel -> VOX (mode=direct)",
+            "convert_mode_default": _normalize_convert_mode(os.environ.get("CONVERT_MODE", "direct")),
+            "pipeline": _pipeline_flow_text(),
+            "pipelines": {
+                "glb": "image -> TRELLIS mesh -> bake GLB -> voxelize -> VOX2",
+                "direct": "image -> TRELLIS MeshWithVoxel -> quantize attrs/photo -> VOX2",
+            },
             "endpoints": {
                 "GET /health": "status",
                 "POST /convert": "image bytes -> VOX2 bytes (default full img->glb->vox)",
@@ -339,7 +373,8 @@ def main() -> int:
         help="Load weights before accepting traffic (default on). Set PRELOAD=0 to defer.",
     )
     args = parser.parse_args()
-    os.environ.setdefault("CONVERT_MODE", "glb")
+    os.environ.setdefault("CONVERT_MODE", "direct")
+    os.environ.setdefault("MATERIAL_MODE", "color")
 
     if args.preload:
         print(f"[server] preloading model={args.model} …", flush=True)
@@ -354,12 +389,31 @@ def main() -> int:
         threading.Thread(target=_bg_load, name="model-load", daemon=True).start()
         print("[server] loading model in background; /health will report ready=false until done", flush=True)
 
+    mode = _normalize_convert_mode(os.environ.get("CONVERT_MODE", "direct"))
     print(f"[server] listening on http://{args.host}:{args.port}", flush=True)
+    print(f"[server] default CONVERT_MODE={mode}", flush=True)
+    print(f"[server] flow: {_pipeline_flow_text(mode)}", flush=True)
     print(
-        f"[server] POST /convert  image -> VOX2  default mode={os.environ.get('CONVERT_MODE', 'glb')} "
-        "(full image->GLB->VOX; pass mode=direct for old shortcut)",
+        "[server] POST /convert  (override with ?mode=glb|direct&out_res=...&material_mode=...)",
         flush=True,
     )
+    if mode == "glb":
+        print(
+            "[server] glb knobs: "
+            f"DECIMATE_TARGET={os.environ.get('DECIMATE_TARGET', '150000')} "
+            f"TEXTURE_SIZE={os.environ.get('TEXTURE_SIZE', '1024')} "
+            f"PHOTO_COLOR={os.environ.get('PHOTO_COLOR', '1')} "
+            f"COLOR_MODE={os.environ.get('COLOR_MODE', 'texture')}",
+            flush=True,
+        )
+    else:
+        print(
+            "[server] direct knobs: "
+            f"MATERIAL_MODE={os.environ.get('MATERIAL_MODE', 'color')} "
+            f"COLOR_AXIS={os.environ.get('COLOR_AXIS', 'auto')} "
+            f"OUT_RES={os.environ.get('OUT_RES', '256')}",
+            flush=True,
+        )
     # threaded=False: GPU conversion already serialized by runtime lock;
     # keep Flask simple (one waiters queue). Use waitress/gunicorn for prod if needed.
     APP.run(host=args.host, port=args.port, threaded=True, use_reloader=False)

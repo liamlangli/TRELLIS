@@ -174,7 +174,7 @@ class TrellisVoxRuntime:
     ) -> None:
         # GLB path needs real o_voxel/cumesh/nvdiffrast. Default on unless CONVERT_MODE=direct.
         if require_full_stack is None:
-            mode = (os.environ.get("CONVERT_MODE", "glb") or "glb").strip().lower()
+            mode = (os.environ.get("CONVERT_MODE", "direct") or "direct").strip().lower()
             require_full_stack = mode not in ("direct", "fast", "mesh", "mesh_voxel", "direct_mesh")
         bootstrap_env(allow_stubs=not require_full_stack)
         if require_full_stack:
@@ -350,7 +350,7 @@ class TrellisVoxRuntime:
         *,
         seed: int = 0,
         pipeline_type: str = "512",
-        material_mode: str = "image",
+        material_mode: str = "color",
         out_res: int = 256,
         alpha_threshold: float = 0.5,
         color_axis: str = "auto",
@@ -378,10 +378,11 @@ class TrellisVoxRuntime:
     ) -> ConvertResult:
         """image -> VOX.
 
-        Default mode is the full local pipeline:
-          preprocess -> TRELLIS mesh -> simplify -> o_voxel.to_glb -> CuMesh voxelize -> VOX2
+        Default mode is the direct TRELLIS voxel path:
+          preprocess -> TRELLIS MeshWithVoxel -> quantize base_color -> VOX2
 
-        mode="direct" keeps the old shortcut that samples TRELLIS MeshWithVoxel
+        mode="glb" uses the longer bake path: mesh -> textured GLB -> voxelize -> VOX2
+        mode="direct" samples TRELLIS MeshWithVoxel
         occupancy without baking a textured GLB.
         """
         if not self._ready or self.pipeline is None:
@@ -403,11 +404,11 @@ class TrellisVoxRuntime:
         if pil.mode not in ("RGB", "RGBA"):
             pil = pil.convert("RGBA" if "A" in pil.getbands() else "RGB")
 
-        material_mode = (material_mode or "image").lower()
+        material_mode = (material_mode or "color").lower()
         pipeline_type = pipeline_type or "512"
         out_res = int(out_res)
         seed = int(seed)
-        mode = (mode or os.environ.get("CONVERT_MODE", "glb") or "glb").strip().lower()
+        mode = (mode or os.environ.get("CONVERT_MODE", "direct") or "direct").strip().lower()
         if mode in ("full", "img_glb_vox", "image_glb_vox", "glb_path"):
             mode = "glb"
         if mode in ("fast", "mesh", "mesh_voxel", "direct_mesh"):
@@ -545,7 +546,7 @@ class TrellisVoxRuntime:
                 tmp_dir = Path(tempfile.mkdtemp(prefix="trellis_img_glb_vox_"))
                 glb_path = tmp_dir / "sample.glb"
                 try:
-                    glb.export(str(glb_path), extension_webp=True)
+                    glb.export(str(glb_path), extension_webp=False)
                     glb_bytes = glb_path.read_bytes() if keep_glb else None
                     keep_dir = os.environ.get("TRELLIS_KEEP_GLB_DIR") or os.environ.get("KEEP_GLB_DIR")
                     if keep_dir or keep_glb:
@@ -610,11 +611,40 @@ class TrellisVoxRuntime:
                         ) from last_err
                     native_size = tuple(stats.get("size", (grid.size_x, grid.size_y, grid.size_z)))
                     native_solid = int(stats.get("solid", grid.count_solid()))
-                    # material_mode is not used on the GLB path; report color_mode instead.
-                    material_mode = c_mode
+                    # Geometry comes from GLB occupancy; final colors track the source photo.
+                    color_mode_used = c_mode
                     # GLB/glTF is Y-up already (no TRELLIS Z-up swap).
                     # Orient so default +Z camera matches source image: swap X/Z then flip X.
                     grid = vox_io.orient_glb_to_vox(grid)
+
+                    # Optional photo-matching for GLB path: re-paint solids from the input image.
+                    force_photo = (
+                        os.environ.get("PHOTO_COLOR", "1") != "0"
+                        and str(material_mode or "color").lower() not in ("texture", "glb", "baked")
+                    )
+                    if force_photo:
+                        print(
+                            "[runtime] photo-matching: repainting GLB occupancy from source image",
+                            flush=True,
+                        )
+                        try:
+                            grid, palette = vox_io.recolor_grid_from_image(
+                                grid,
+                                pre_image,
+                                color_axis=color_axis or "auto",
+                                max_colors=int(max_colors or os.environ.get("MAX_COLORS", "255")),
+                                alpha_threshold=float(alpha_threshold),
+                            )
+                            material_mode = f"glb+photo:{color_axis or 'auto'}"
+                        except Exception as e:
+                            print(
+                                f"[runtime] photo recolor failed, keeping baked texture colors: {e}",
+                                flush=True,
+                            )
+                            material_mode = color_mode_used
+                    else:
+                        material_mode = color_mode_used
+
                     vox_bytes = vox_io.encode(
                         grid,
                         use_zstd=True,
@@ -652,7 +682,7 @@ class TrellisVoxRuntime:
                     )
                     grid, palette = vox_io.grid_from_mesh_with_voxel(
                         mesh,
-                        material_mode=(os.environ.get("MATERIAL_MODE", "image") or "image").lower(),
+                        material_mode=(os.environ.get("MATERIAL_MODE", "color") or "color").lower(),
                         alpha_threshold=float(alpha_threshold),
                         max_colors=int(max_colors or os.environ.get("MAX_COLORS", "255")),
                         crop=True if crop is None else bool(crop),
@@ -674,7 +704,7 @@ class TrellisVoxRuntime:
                         use_zstd=True,
                         palette=palette,
                     )
-                    material_mode = (os.environ.get("MATERIAL_MODE", "image") or "image").lower()
+                    material_mode = (os.environ.get("MATERIAL_MODE", "color") or "color").lower()
                     mode = "glb+direct_fallback"
             elapsed = time.time() - t0
             print(

@@ -1427,6 +1427,57 @@ def _base_color_plausible(base_rgb, color_image=None, *, max_colors: int = 255) 
     return dist < 42.0
 
 
+
+def palette_or_rgb_washed(
+    rgb_or_palette,
+    color_image=None,
+    *,
+    max_mean_chroma: float = 14.0,
+    grey_frac_thr: float = 0.82,
+    min_image_chroma_ratio: float = 0.55,
+) -> bool:
+    """True when colors are nearly grey/monochrome relative to the source photo."""
+    arr = np.asarray(rgb_or_palette, dtype=np.float64)
+    if arr.ndim == 2 and arr.shape[1] >= 3:
+        rgb = arr[:, :3]
+    else:
+        rgb = np.asarray(rgb_or_palette, dtype=np.float64).reshape(-1, 3)
+    if rgb.size == 0:
+        return True
+    if float(np.nanmax(np.abs(rgb))) <= 1.5:
+        rgb = rgb * 255.0
+    chroma = np.max(rgb, axis=1) - np.min(rgb, axis=1)
+    mean_c = float(np.mean(chroma))
+    # LAB-ish opponent channels (cheap): strong greys cluster near zero a/b.
+    r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    a = r - g
+    bb = 0.5 * (r + g) - b
+    opp = np.sqrt(a * a + bb * bb)
+    grey_frac = float(np.mean(opp < 18.0))
+    washed_self = (mean_c < max_mean_chroma) or (grey_frac >= grey_frac_thr and mean_c < 28.0)
+    if color_image is None or not washed_self:
+        return washed_self
+    try:
+        # Prefer high-chroma samples from the photo so studio-grey BG cannot dilute.
+        full = np.asarray(
+            color_image.convert("RGB") if hasattr(color_image, "convert") else color_image,
+            dtype=np.float64,
+        ).reshape(-1, 3)
+        img_chroma = np.max(full, axis=1) - np.min(full, axis=1)
+        # top-quartile chroma of the photo
+        thr = float(np.quantile(img_chroma, 0.75))
+        vivid = full[img_chroma >= max(thr, 12.0)]
+        if vivid.size == 0:
+            vivid = full
+        img_c = float(np.mean(np.max(vivid, axis=1) - np.min(vivid, axis=1)))
+    except Exception:
+        return washed_self
+    if img_c < 12.0:
+        return washed_self
+    # Relative to vivid photo content
+    return mean_c < max(10.0, img_c * float(min_image_chroma_ratio)) or grey_frac >= grey_frac_thr
+
+
 def _auto_color_axis(coords: np.ndarray, color_image) -> str:
     """Pick orthographic axis that best matches a single photo to the volume.
 
@@ -1472,7 +1523,7 @@ def _auto_color_axis(coords: np.ndarray, color_image) -> str:
 
 def grid_from_mesh_with_voxel(
     mesh,
-    material_mode: str = "image",
+    material_mode: str = "color",
     alpha_threshold: float = 0.5,
     max_colors: int = 255,
     crop: bool = True,
@@ -1483,10 +1534,10 @@ def grid_from_mesh_with_voxel(
     """Convert a TRELLIS MeshWithVoxel into a VOX2 VoxelGrid.
 
     material_mode:
-      - "image": orthographic-project ``color_image`` onto occupancy (default)
-      - "color": quantize decoded base_color / alpha attrs from TRELLIS
+      - "color": quantize decoded base_color / alpha attrs from TRELLIS (default)
+      - "auto": TRELLIS base_color when plausible; else image projection
+      - "image": orthographic projection of ``color_image`` onto occupancy
       - "solid": occupancy only
-      - "auto": use mesh colour only when it tracks the photo; else image project
     """
     coords = mesh.coords
     if hasattr(coords, "detach"):
@@ -1497,7 +1548,7 @@ def grid_from_mesh_with_voxel(
     coords = coords[:, :3].astype(np.int64)
 
     palette = None
-    mode = (material_mode or "image").lower()
+    mode = (material_mode or "color").lower()
 
     def _from_mesh_color():
         attrs = getattr(mesh, "attrs", None)
@@ -1525,6 +1576,36 @@ def grid_from_mesh_with_voxel(
         )
         return mats, pal
 
+    def _shell_weights(coords_i: np.ndarray, axis: str, band: int = 2) -> np.ndarray:
+        """1 for voxels near the front silhouette along an orthographic axis."""
+        c = np.asarray(coords_i, dtype=np.int64)
+        if axis == "xy":
+            u, v, depth = c[:, 0], c[:, 1], c[:, 2]
+        elif axis == "xz":
+            u, v, depth = c[:, 0], c[:, 2], c[:, 1]
+        elif axis in ("zy", "yz"):
+            u, v, depth = c[:, 2], c[:, 1], c[:, 0]
+        else:
+            raise ValueError(axis)
+        # pack UV key
+        umin, vmin = int(u.min()), int(v.min())
+        us = (u - umin).astype(np.int64)
+        vs = (v - vmin).astype(np.int64)
+        key = us * (int(vs.max()) + 1 if vs.size else 1) + vs
+        order = np.argsort(key, kind="mergesort")
+        key_s = key[order]
+        depth_s = depth[order]
+        starts = np.r_[0, 1 + np.flatnonzero(key_s[1:] != key_s[:-1])]
+        # front = max depth on each ray (vectorized)
+        front_vals = np.maximum.reduceat(depth_s, starts)
+        group_ids = np.repeat(np.arange(starts.size), np.diff(np.r_[starts, key_s.size]))
+        front = front_vals[group_ids]
+        dist = front - depth_s
+        w_s = np.clip(1.0 - dist.astype(np.float32) / float(max(band, 1)), 0.05, 1.0)
+        w = np.empty_like(w_s)
+        w[order] = w_s
+        return w
+
     def _from_image_projection():
         if color_image is None:
             raise ValueError("material_mode='image' requires color_image=")
@@ -1533,26 +1614,54 @@ def grid_from_mesh_with_voxel(
                 np.zeros((0,), dtype=np.uint8),
                 np.zeros((0, 3), dtype=np.uint8),
             )
-        axis = (color_axis or "auto").lower()
-        if axis in ("", "auto"):
-            axis = _auto_color_axis(coords, color_image)
-            print(f"[vox] image projection axis={axis}", flush=True)
-        else:
-            print(f"[vox] image projection axis={axis} (forced)", flush=True)
         # Palette from the real image FG so roof/wood/cloth hues stay faithful.
         pal = extract_image_palette(
             color_image,
             max_colors=max_colors,
             alpha_threshold=min(float(alpha_threshold), 0.1),
         )
-        base, _fg = project_image_colors(
-            coords,
-            color_image,
-            axis=axis,
-            percentile=1.0,
-            alpha_threshold=min(float(alpha_threshold), 0.1),
-            fill_background=True,
-        )
+        axis = (color_axis or "auto").lower()
+        if axis in ("multi", "all"):
+            preferred = _auto_color_axis(coords, color_image)
+            axes = []
+            for a in (preferred, "xz", "zy", "xy"):
+                if a not in axes:
+                    axes.append(a)
+            print(f"[vox] multi-axis image projection preferred={preferred} axes={axes}", flush=True)
+        elif axis in ("", "auto"):
+            preferred = _auto_color_axis(coords, color_image)
+            axes = [preferred]
+            print(f"[vox] image projection axis={preferred} (photo match, no depth stripe fill)", flush=True)
+        else:
+            axes = [axis]
+            print(f"[vox] image projection axis={axis} (forced, no depth stripe fill)", flush=True)
+
+        bases = []
+        weights = []
+        thr = min(float(alpha_threshold), 0.1)
+        for a in axes:
+            base_a, _fg = project_image_colors(
+                coords,
+                color_image,
+                axis=a,
+                percentile=1.0,
+                alpha_threshold=thr,
+                fill_background=True,
+                depth_fill=False,
+            )
+            bases.append(np.asarray(base_a, dtype=np.float32))
+            # Preferred/forced axis gets a mild prior so auto still leans front view.
+            prior = 1.35 if (len(axes) > 1 and a == axes[0]) else 1.0
+            weights.append(_shell_weights(coords, a, band=2) * prior)
+
+        if len(bases) == 1:
+            base = bases[0]
+        else:
+            wstack = np.stack(weights, axis=1)  # (N,A)
+            cstack = np.stack(bases, axis=1)    # (N,A,3)
+            wsum = wstack.sum(axis=1, keepdims=True).clip(min=1e-6)
+            base = (cstack * wstack[..., None]).sum(axis=1) / wsum
+
         mats, pal = materials_from_colors(
             base,
             alpha=None,
@@ -1604,6 +1713,108 @@ def grid_from_mesh_with_voxel(
     if crop:
         grid = grid.crop_to_solid()
     return grid, palette
+
+
+
+def recolor_grid_from_image(
+    grid: "VoxelGrid",
+    color_image,
+    *,
+    color_axis: str = "auto",
+    max_colors: int = 255,
+    alpha_threshold: float = 0.1,
+) -> Tuple["VoxelGrid", np.ndarray]:
+    """Re-paint solid cells of an existing grid using multi-axis image projection."""
+    solid = np.argwhere(grid.data != 0)
+    if solid.size == 0:
+        return grid, np.zeros((0, 3), dtype=np.uint8)
+    coords = np.stack([solid[:, 2], solid[:, 1], solid[:, 0]], axis=1).astype(np.int64)
+
+    pal = extract_image_palette(
+        color_image,
+        max_colors=max_colors,
+        alpha_threshold=min(float(alpha_threshold), 0.1),
+    )
+    mode_axis = (color_axis or "auto").lower()
+    if mode_axis in ("multi", "all"):
+        preferred = _auto_color_axis(coords, color_image)
+        axes = []
+        for a in (preferred, "xz", "zy", "xy"):
+            if a not in axes:
+                axes.append(a)
+        print(f"[vox] recolor multi-axis preferred={preferred} axes={axes}", flush=True)
+    elif mode_axis in ("", "auto"):
+        preferred = _auto_color_axis(coords, color_image)
+        axes = [preferred]
+        print(f"[vox] recolor photo axis={preferred}", flush=True)
+    else:
+        axes = [mode_axis]
+        print(f"[vox] recolor axis={mode_axis}", flush=True)
+
+    def _shell_w(coords_i: np.ndarray, axis: str, band: int = 2) -> np.ndarray:
+        c = np.asarray(coords_i, dtype=np.int64)
+        if axis == "xy":
+            u, v, depth = c[:, 0], c[:, 1], c[:, 2]
+        elif axis == "xz":
+            u, v, depth = c[:, 0], c[:, 2], c[:, 1]
+        else:
+            u, v, depth = c[:, 2], c[:, 1], c[:, 0]
+        umin, vmin = int(u.min()), int(v.min())
+        us = (u - umin).astype(np.int64)
+        vs = (v - vmin).astype(np.int64)
+        key = us * (int(vs.max()) + 1 if vs.size else 1) + vs
+        order = np.argsort(key, kind="mergesort")
+        key_s = key[order]
+        depth_s = depth[order]
+        starts = np.r_[0, 1 + np.flatnonzero(key_s[1:] != key_s[:-1])]
+        front_vals = np.maximum.reduceat(depth_s, starts)
+        group_ids = np.repeat(np.arange(starts.size), np.diff(np.r_[starts, key_s.size]))
+        front = front_vals[group_ids]
+        dist = front - depth_s
+        w_s = np.clip(1.0 - dist.astype(np.float32) / float(max(band, 1)), 0.05, 1.0)
+        w = np.empty_like(w_s)
+        w[order] = w_s
+        return w
+
+    thr = min(float(alpha_threshold), 0.1)
+    bases = []
+    weights = []
+    for a in axes:
+        base_a, _ = project_image_colors(
+            coords,
+            color_image,
+            axis=a,
+            percentile=1.0,
+            alpha_threshold=thr,
+            fill_background=True,
+            depth_fill=False,
+        )
+        bases.append(np.asarray(base_a, dtype=np.float32))
+        prior = 1.35 if (len(axes) > 1 and a == axes[0]) else 1.0
+        weights.append(_shell_w(coords, a, band=2) * prior)
+    if len(bases) == 1:
+        base = bases[0]
+    else:
+        wstack = np.stack(weights, axis=1)
+        cstack = np.stack(bases, axis=1)
+        wsum = wstack.sum(axis=1, keepdims=True).clip(min=1e-6)
+        base = (cstack * wstack[..., None]).sum(axis=1) / wsum
+
+    mats, pal = materials_from_colors(
+        base,
+        alpha=None,
+        alpha_threshold=0.0,
+        max_colors=max_colors,
+        palette=pal,
+    )
+    mats = np.asarray(mats, dtype=np.uint8)
+    if np.any(mats == 0):
+        mats = mats.copy()
+        mats[mats == 0] = 1
+    out = np.zeros_like(grid.data)
+    out[solid[:, 0], solid[:, 1], solid[:, 2]] = mats
+    return VoxelGrid(out), np.asarray(pal, dtype=np.uint8)
+
 
 
 def write_palette_png(path: PathLike, palette: np.ndarray) -> None:
