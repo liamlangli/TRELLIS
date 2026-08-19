@@ -83,7 +83,7 @@ echo     GET  /health
 echo     POST /convert[?mode=glb^|direct^&out_res=256^&...]
 echo     POST /convert.json
 echo   Client tip:
-echo     tovox.bat image.jpg out.vox 256
+echo     tovox.bat image.jpg out.vox 256 64
 echo ============================================================
 echo.
 

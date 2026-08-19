@@ -25,6 +25,11 @@ if not "%~3"=="" (
   set "OUT_RES=%~3"
 )
 
+REM Optional 4th arg: max palette colors (1..255; index 0 is air). Overrides MAX_COLORS env.
+if not "%~4"=="" (
+  set "MAX_COLORS=%~4"
+)
+
 if not exist "!IN_IMG!" (
   echo [ERROR] Image not found: %~1
   echo         resolved: !IN_IMG!
@@ -37,6 +42,20 @@ if defined OUT_RES (
   if errorlevel 1 (
     echo [ERROR] Invalid max resolution: !OUT_RES!
     echo         Expected a positive integer, e.g. 128 or 256.
+    exit /b 1
+  )
+)
+
+if defined MAX_COLORS (
+  echo !MAX_COLORS!| findstr /R /C:"^[1-9][0-9]*$" >nul
+  if errorlevel 1 (
+    echo [ERROR] Invalid max colors: !MAX_COLORS!
+    echo         Expected a positive integer 1..255, e.g. 16 or 64.
+    exit /b 1
+  )
+  if !MAX_COLORS! GTR 255 (
+    echo [ERROR] Invalid max colors: !MAX_COLORS!
+    echo         Expected a positive integer 1..255 ^(VOX palette index 0 is air^).
     exit /b 1
   )
 )
@@ -54,6 +73,7 @@ if defined SEED set "QUERY=!QUERY!&seed=!SEED!"
 if defined PIPELINE_TYPE set "QUERY=!QUERY!&pipeline_type=!PIPELINE_TYPE!"
 if defined MATERIAL_MODE set "QUERY=!QUERY!&material_mode=!MATERIAL_MODE!"
 if defined OUT_RES set "QUERY=!QUERY!&out_res=!OUT_RES!"
+if defined MAX_COLORS set "QUERY=!QUERY!&max_colors=!MAX_COLORS!"
 if defined ALPHA_THR set "QUERY=!QUERY!&alpha_threshold=!ALPHA_THR!"
 if defined COLOR_AXIS set "QUERY=!QUERY!&color_axis=!COLOR_AXIS!"
 if defined DOWNSAMPLE_DEVICE set "QUERY=!QUERY!&downsample_device=!DOWNSAMPLE_DEVICE!"
@@ -78,6 +98,11 @@ if defined OUT_RES (
   echo   out_res:!OUT_RES!
 ) else (
   echo   out_res:^(server default^)
+)
+if defined MAX_COLORS (
+  echo   colors: !MAX_COLORS!
+) else (
+  echo   colors:^(server default^)
 )
 echo.
 
@@ -131,13 +156,14 @@ echo OK wrote !OUT_VOX!  bytes=!FINAL_SIZE!
 exit /b 0
 
 :usage
-echo Usage: tovox.bat input.png [output.vox] [max_res]
+echo Usage: tovox.bat input.png [output.vox] [max_res] [max_colors]
 echo.
 echo Examples:
 echo   tovox.bat a.png
 echo   tovox.bat a.png b.vox
 echo   tovox.bat a.png b.vox 128
-echo   tovox.bat .\photos\a.png out\b.vox 256
+echo   tovox.bat a.png b.vox 128 32
+echo   tovox.bat .\photos\a.png out\b.vox 256 64
 echo.
 echo Paths are resolved from the current working directory.
 echo Converts via HTTP against a running server_vox instance.
@@ -147,10 +173,12 @@ echo.
 echo If output is omitted, writes ^<input^>.vox next to the image.
 echo max_res is the longest-axis voxel resolution (query out_res).
 echo It overrides OUT_RES env for this call when provided.
+echo max_colors limits palette size to 1..255 (query max_colors; VOX index 0 is air).
+echo It overrides MAX_COLORS env for this call when provided.
 echo Server URL: set VOX_URL=http://127.0.0.1:8080
 echo        or: set VOX_HOST / VOX_PORT
-echo Optional convert overrides: CONVERT_MODE/MODE=glb|direct, SEED, PIPELINE_TYPE,
-echo OUT_RES, COLOR_MODE, VOX_FILL, SURFACE_BAND, DECIMATE_TARGET(default 150000), TEXTURE_SIZE(default 1024),
+echo Optional convert overrides: CONVERT_MODE/MODE=glb^|direct, SEED, PIPELINE_TYPE,
+echo OUT_RES, MAX_COLORS, COLOR_MODE, VOX_FILL, SURFACE_BAND, DECIMATE_TARGET(default 150000), TEXTURE_SIZE(default 1024),
 echo KEEP_GLB, MATERIAL_MODE(default color), ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE
 echo Default server mode is direct ^(TRELLIS voxels + base_color^); override with CONVERT_MODE=glb.
 exit /b 1
