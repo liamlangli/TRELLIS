@@ -899,8 +899,8 @@ def _rgb_u8(colors: np.ndarray) -> np.ndarray:
 
 def _nearest_palette_ids(rgb_u8: np.ndarray, palette: np.ndarray, chunk: int = 65536) -> np.ndarray:
     """Assign each RGB row to nearest palette entry (0-based indices)."""
-    rgb = np.asarray(rgb_u8, dtype=np.int16).reshape(-1, 3)
-    pal = np.asarray(palette, dtype=np.int16).reshape(-1, 3)
+    rgb = np.asarray(rgb_u8, dtype=np.int32).reshape(-1, 3)
+    pal = np.asarray(palette, dtype=np.int32).reshape(-1, 3)
     if pal.shape[0] == 0:
         raise ValueError("empty palette")
     out = np.empty(rgb.shape[0], dtype=np.int32)
@@ -1152,11 +1152,15 @@ def transfer_colors_to_image(
     alpha_threshold: float = 0.1,
     gain_min: float = 0.5,
     gain_max: float = 3.0,
+    gamut_tolerance: float = 8.0,
 ) -> np.ndarray:
     """Reinhard lab transfer: match palette stats to the photo foreground.
 
     Keeps per-voxel spatial variation (3D-consistent) while restoring the
     saturation/luma range the generative base_color decode compresses.
+    Colors that move outside the source-image gamut are snapped back to the
+    nearest source color so a global Lab shift cannot invent hues (for example,
+    turning dark hair red).
     """
     pal = np.asarray(palette, dtype=np.float64).reshape(-1, 3)
     w = np.asarray(weights, dtype=np.float64).reshape(-1)
@@ -1176,7 +1180,24 @@ def transfer_colors_to_image(
     gain = std_i / np.maximum(std_p, 1e-6)
     gain[0] = np.clip(gain[0], 0.5, 2.0)
     gain[1:] = np.clip(gain[1:], gain_min, gain_max)
-    return _lab_to_rgb((lab_p - mean_p) * gain + mean_i)
+    transferred = _lab_to_rgb((lab_p - mean_p) * gain + mean_i)
+    source_palette = extract_image_palette(
+        color_image,
+        max_colors=VOX_PALETTE_MAX - 1,
+        alpha_threshold=min(float(alpha_threshold), 0.1),
+    )
+    nearest_ids = _nearest_palette_ids(transferred, source_palette)
+    nearest = source_palette[nearest_ids]
+    distance = np.sqrt(
+        np.sum(
+            (transferred.astype(np.int32) - nearest.astype(np.int32)) ** 2,
+            axis=1,
+        )
+    )
+    outside = distance > float(gamut_tolerance)
+    if np.any(outside):
+        transferred[outside] = nearest[outside]
+    return transferred
 
 
 def _load_image_rgb_alpha(image, *, alpha_threshold: float = 0.1, bg_luma: float = 16.0):
