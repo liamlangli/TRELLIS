@@ -11,7 +11,7 @@ if not exist ".venv\Scripts\python.exe" (
 if not defined HOST set "HOST=0.0.0.0"
 if not defined PORT set "PORT=8080"
 if not defined CONVERT_MODE set "CONVERT_MODE=direct"
-if not defined MATERIAL_MODE set "MATERIAL_MODE=color"
+if not defined MATERIAL_MODE set "MATERIAL_MODE=image"
 if not defined COLOR_MODE set "COLOR_MODE=texture"
 if not defined OUT_RES set "OUT_RES=256"
 if not defined PIPELINE_TYPE set "PIPELINE_TYPE=512"
