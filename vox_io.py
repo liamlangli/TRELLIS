@@ -612,7 +612,7 @@ def build_palette_table(
             # deterministic grey fallback so missing colors stay readable
             tone = 64 + (material * 17) % 160
             r = g = b = int(tone)
-        rows.append(np.array((r, g, b, material), dtype=np.uint8))
+        rows.append(np.array((r, g, b, MATERIAL_SOLID), dtype=np.uint8))
         remap[material] = np.uint8(idx)
 
     table = np.stack(rows, axis=0).astype(np.uint8)
