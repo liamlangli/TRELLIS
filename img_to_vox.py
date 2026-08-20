@@ -52,6 +52,7 @@ _ensure_venv()
 sys.path.insert(0, str(ROOT))
 
 from trellis_vox_runtime import TrellisVoxRuntime, bootstrap_env  # noqa: E402
+os.environ.setdefault("CONVERT_MODE", "direct")
 
 bootstrap_env()
 
