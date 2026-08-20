@@ -173,6 +173,15 @@ Upon execution, the script generates the following files:
 
 **Note:** The `.glb` file is exported in `OPAQUE` mode by default. Although the alpha channel is preserved within the texture map, it is not active initially. To enable transparency, import the asset into your 3D software and manually connect the texture's alpha channel to the material's opacity or alpha input.
 
+#### One-shot Image to GLB
+
+Use [img_to_glb.py](img_to_glb.py) to run the default web-demo generation and GLB export flow directly from the command line:
+```sh
+python img_to_glb.py assets/example_image/T.png output.glb
+```
+
+The script defaults to the 1024 cascade pipeline, a 500,000-face decimation target, and a 2048-pixel texture. Set `SEED`, `RESOLUTION`, `DECIMATION_TARGET`, `TEXTURE_SIZE`, or `REMESH` to override the defaults.
+
 #### Web Demo
 
 [app.py](app.py) provides a simple web demo for image to 3D asset generation. you can run the demo with the following command:
