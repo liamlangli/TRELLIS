@@ -6,12 +6,12 @@ Default path matches serve.bat:
   image -> TRELLIS mesh -> textured GLB -> CuMesh voxelize -> VOX2
 
 Usage:
-    img_to_vox.py input.png [output.vox]
+    img_to_vox.py input.png [output.vox] [max_resolution] [max_colors]
 
 Loads the model in-process. For repeated conversions without reloading
 weights, start server_vox.py / serve.bat and use tovox.bat instead.
 
-Env: CONVERT_MODE=glb|direct (default glb), SEED, PIPELINE_TYPE, OUT_RES,
+Env: CONVERT_MODE=glb|direct (default direct), SEED, PIPELINE_TYPE, OUT_RES,
      MATERIAL_MODE (direct only), COLOR_MODE/VOX_FILL/SURFACE_BAND (glb path),
      TRELLIS_MODEL, ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE
 """
@@ -61,10 +61,12 @@ import vox_io  # noqa: E402
 
 def _usage() -> None:
     print(
-        "Usage: img_to_vox.py input.png [output.vox]\n"
+        "Usage: img_to_vox.py input.png [output.vox] [max_resolution] [max_colors]\n"
+        "  max_resolution  maximum voxel-grid dimension (1..1024, default 256)\n"
+        "  max_colors      maximum solid color count (1..255, default 255)\n"
         "\n"
         "Optional env overrides: CONVERT_MODE=glb|direct, SEED, PIPELINE_TYPE,\n"
-        "OUT_RES, COLOR_MODE, VOX_FILL, SURFACE_BAND, MATERIAL_MODE,\n"
+        "OUT_RES, MAX_COLORS, COLOR_MODE, VOX_FILL, SURFACE_BAND, MATERIAL_MODE,\n"
         "TRELLIS_MODEL, ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE",
         file=sys.stderr,
     )
@@ -78,12 +80,39 @@ def main() -> int:
 
     image_path = Path(args[0])
     out_path = Path(args[1]) if len(args) >= 2 else image_path.with_suffix(".vox")
+    if len(args) > 4:
+        _usage()
+        return 1
+
+    def bounded_int(value: str, name: str, minimum: int, maximum: int) -> int:
+        try:
+            parsed = int(value)
+        except ValueError:
+            parsed = 0
+        if parsed < minimum or parsed > maximum:
+            print(
+                f"error: {name} must be {minimum}..{maximum}, got {value}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        return parsed
 
     pipeline_type = os.environ.get("PIPELINE_TYPE", "512")
     seed = int(os.environ.get("SEED", "0"))
     model = os.environ.get("TRELLIS_MODEL", "microsoft/TRELLIS.2-4B")
     material_mode = os.environ.get("MATERIAL_MODE", "color").lower()
-    out_res = int(os.environ.get("OUT_RES", "256"))
+    out_res = bounded_int(
+        args[2] if len(args) >= 3 else os.environ.get("OUT_RES", "256"),
+        "max_resolution",
+        1,
+        vox_io.VOX_SIZE_MAX,
+    )
+    max_colors = bounded_int(
+        args[3] if len(args) >= 4 else os.environ.get("MAX_COLORS", "255"),
+        "max_colors",
+        1,
+        vox_io.VOX_PALETTE_MAX - 1,
+    )
 
     if not image_path.is_file():
         print(f"error: image not found: {image_path}", file=sys.stderr)
@@ -110,6 +139,7 @@ def main() -> int:
         pipeline_type=pipeline_type,
         material_mode=material_mode,
         out_res=out_res,
+        max_colors=max_colors,
         alpha_threshold=float(os.environ.get("ALPHA_THR", "0.5")),
         color_axis=os.environ.get("COLOR_AXIS", "auto"),
         downsample_device=os.environ.get("DOWNSAMPLE_DEVICE"),
