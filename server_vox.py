@@ -105,7 +105,7 @@ def _normalize_convert_mode(mode: str | None) -> str:
 def _pipeline_flow_text(mode: str | None = None) -> str:
     m = _normalize_convert_mode(mode)
     if m == "direct":
-        mm = (os.environ.get("MATERIAL_MODE", "image") or "image").strip().lower()
+        mm = (os.environ.get("MATERIAL_MODE", "color") or "color").strip().lower()
         return (
             "image -> TRELLIS MeshWithVoxel -> quantize "
             f"(material_mode={mm}) -> VOX2"
@@ -164,7 +164,7 @@ def _parse_convert_options(req: Request) -> dict:
             _pick(req, "pipeline_type", "pipelineType", default=os.environ.get("PIPELINE_TYPE", "512"))
         ),
         "material_mode": str(
-            _pick(req, "material_mode", "materialMode", default=os.environ.get("MATERIAL_MODE", "image"))
+            _pick(req, "material_mode", "materialMode", default=os.environ.get("MATERIAL_MODE", "color"))
         ).lower(),
         "out_res": int(out_res),
         "alpha_threshold": float(
@@ -374,7 +374,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     os.environ.setdefault("CONVERT_MODE", "direct")
-    os.environ.setdefault("MATERIAL_MODE", "image")
+    os.environ.setdefault("MATERIAL_MODE", "color")
 
     if args.preload:
         print(f"[server] preloading model={args.model} …", flush=True)
@@ -409,7 +409,7 @@ def main() -> int:
     else:
         print(
             "[server] direct knobs: "
-            f"MATERIAL_MODE={os.environ.get('MATERIAL_MODE', 'image')} "
+            f"MATERIAL_MODE={os.environ.get('MATERIAL_MODE', 'color')} "
             f"COLOR_AXIS={os.environ.get('COLOR_AXIS', 'auto')} "
             f"OUT_RES={os.environ.get('OUT_RES', '256')}",
             flush=True,

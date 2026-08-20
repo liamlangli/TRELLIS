@@ -81,7 +81,7 @@ def main() -> int:
     pipeline_type = os.environ.get("PIPELINE_TYPE", "512")
     seed = int(os.environ.get("SEED", "0"))
     model = os.environ.get("TRELLIS_MODEL", "microsoft/TRELLIS.2-4B")
-    material_mode = os.environ.get("MATERIAL_MODE", "image").lower()
+    material_mode = os.environ.get("MATERIAL_MODE", "color").lower()
     out_res = int(os.environ.get("OUT_RES", "256"))
 
     if not image_path.is_file():

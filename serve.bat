@@ -11,7 +11,8 @@ if not exist ".venv\Scripts\python.exe" (
 if not defined HOST set "HOST=0.0.0.0"
 if not defined PORT set "PORT=8080"
 if not defined CONVERT_MODE set "CONVERT_MODE=direct"
-if not defined MATERIAL_MODE set "MATERIAL_MODE=image"
+if not defined MATERIAL_MODE set "MATERIAL_MODE=color"
+if not defined COLOR_TRANSFER set "COLOR_TRANSFER=1"
 if not defined COLOR_MODE set "COLOR_MODE=texture"
 if not defined OUT_RES set "OUT_RES=256"
 if not defined PIPELINE_TYPE set "PIPELINE_TYPE=512"
@@ -75,7 +76,7 @@ if /I "%MODE_NORM%"=="glb" (
   echo   glb knobs    : DECIMATE_TARGET=%DECIMATE_TARGET%  TEXTURE_SIZE=%TEXTURE_SIZE%
   echo                  REMESH=%REMESH%  VOX_FILL=%VOX_FILL%  SURFACE_BAND=%SURFACE_BAND%
 ) else (
-  echo   direct knobs : MATERIAL_MODE=%MATERIAL_MODE%  COLOR_AXIS=%COLOR_AXIS%  ALPHA_THR=%ALPHA_THR%
+  echo   direct knobs : MATERIAL_MODE=%MATERIAL_MODE%  COLOR_TRANSFER=%COLOR_TRANSFER%  COLOR_AXIS=%COLOR_AXIS%  ALPHA_THR=%ALPHA_THR%
 )
 echo.
 echo   Endpoints:

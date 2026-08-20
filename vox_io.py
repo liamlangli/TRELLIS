@@ -1092,6 +1092,93 @@ def materials_from_colors(
     return materials, palette
 
 
+def _rgb_to_lab(rgb255: np.ndarray) -> np.ndarray:
+    c = np.clip(rgb255, 0, 255).astype(np.float64) / 255.0
+    lin = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    m = np.array(
+        [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ]
+    )
+    xyz = (lin @ m.T) / np.array([0.95047, 1.0, 1.08883])
+    eps = 216.0 / 24389.0
+    kap = 24389.0 / 27.0
+    f = np.where(xyz > eps, np.cbrt(xyz), (kap * xyz + 16.0) / 116.0)
+    return np.stack(
+        [
+            116.0 * f[..., 1] - 16.0,
+            500.0 * (f[..., 0] - f[..., 1]),
+            200.0 * (f[..., 1] - f[..., 2]),
+        ],
+        axis=-1,
+    )
+
+
+def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
+    lab = np.asarray(lab, dtype=np.float64)
+    L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+    fy = (L + 16.0) / 116.0
+    fx = fy + a / 500.0
+    fz = fy - b / 200.0
+    eps = 216.0 / 24389.0
+    kap = 24389.0 / 27.0
+
+    def _finv(f):
+        f3 = f ** 3
+        return np.where(f3 > eps, f3, (116.0 * f - 16.0) / kap)
+
+    xyz = np.stack([_finv(fx) * 0.95047, _finv(fy), _finv(fz) * 1.08883], axis=-1)
+    mi = np.array(
+        [
+            [3.2404542, -1.5371385, -0.4985314],
+            [-0.9692660, 1.8760108, 0.0415560],
+            [0.0556434, -0.2040259, 1.0572252],
+        ]
+    )
+    lin = xyz @ mi.T
+    srgb = np.where(
+        lin <= 0.0031308, lin * 12.92, 1.055 * (np.clip(lin, 0, 1) ** (1 / 2.4)) - 0.055
+    )
+    return np.clip(np.rint(srgb * 255.0), 0, 255).astype(np.uint8)
+
+
+def transfer_colors_to_image(
+    palette: np.ndarray,
+    weights: np.ndarray,
+    color_image,
+    *,
+    alpha_threshold: float = 0.1,
+    gain_min: float = 0.5,
+    gain_max: float = 3.0,
+) -> np.ndarray:
+    """Reinhard lab transfer: match palette stats to the photo foreground.
+
+    Keeps per-voxel spatial variation (3D-consistent) while restoring the
+    saturation/luma range the generative base_color decode compresses.
+    """
+    pal = np.asarray(palette, dtype=np.float64).reshape(-1, 3)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if pal.size == 0 or w.size != pal.shape[0] or w.sum() <= 0:
+        return np.clip(np.rint(pal), 0, 255).astype(np.uint8)
+    _img01, fg, rgb_u8 = _load_image_rgb_alpha(
+        color_image, alpha_threshold=min(float(alpha_threshold), 0.1)
+    )
+    if not np.any(fg):
+        return np.clip(np.rint(pal), 0, 255).astype(np.uint8)
+    lab_p = _rgb_to_lab(pal)
+    lab_i = _rgb_to_lab(rgb_u8[fg].astype(np.float64))
+    mean_p = np.average(lab_p, weights=w, axis=0)
+    std_p = np.sqrt(np.average((lab_p - mean_p) ** 2, weights=w, axis=0))
+    mean_i = lab_i.mean(axis=0)
+    std_i = lab_i.std(axis=0)
+    gain = std_i / np.maximum(std_p, 1e-6)
+    gain[0] = np.clip(gain[0], 0.5, 2.0)
+    gain[1:] = np.clip(gain[1:], gain_min, gain_max)
+    return _lab_to_rgb((lab_p - mean_p) * gain + mean_i)
+
+
 def _load_image_rgb_alpha(image, *, alpha_threshold: float = 0.1, bg_luma: float = 16.0):
     """Return (rgb_float01 HxWx3, fg_mask HxW, rgb_u8 HxWx3)."""
     from PIL import Image as _Image
@@ -1530,6 +1617,7 @@ def grid_from_mesh_with_voxel(
     solid_material: int = MATERIAL_SOLID,
     color_image=None,
     color_axis: str = "auto",
+    photo_match: bool = True,
 ) -> Tuple[VoxelGrid, Optional[np.ndarray]]:
     """Convert a TRELLIS MeshWithVoxel into a VOX2 VoxelGrid.
 
@@ -1574,6 +1662,9 @@ def grid_from_mesh_with_voxel(
             alpha_threshold=min(float(alpha_threshold), 0.15) if alpha is not None else 0.0,
             max_colors=max_colors,
         )
+        if photo_match and color_image is not None and pal.size:
+            counts = np.bincount(mats[mats > 0], minlength=pal.shape[0] + 1)
+            pal = transfer_colors_to_image(pal, counts[1:].astype(np.float64), color_image)
         return mats, pal
 
     def _shell_weights(coords_i: np.ndarray, axis: str, band: int = 2) -> np.ndarray:

@@ -179,6 +179,6 @@ echo Server URL: set VOX_URL=http://127.0.0.1:8080
 echo        or: set VOX_HOST / VOX_PORT
 echo Optional convert overrides: CONVERT_MODE/MODE=glb^|direct, SEED, PIPELINE_TYPE,
 echo OUT_RES, MAX_COLORS, COLOR_MODE, VOX_FILL, SURFACE_BAND, DECIMATE_TARGET(default 150000), TEXTURE_SIZE(default 1024),
-echo KEEP_GLB, MATERIAL_MODE(default image), ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE
+echo KEEP_GLB, MATERIAL_MODE(default color), ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE
 echo Default server mode is direct ^(TRELLIS voxels + base_color^); override with CONVERT_MODE=glb.
 exit /b 1

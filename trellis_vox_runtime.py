@@ -350,10 +350,11 @@ class TrellisVoxRuntime:
         *,
         seed: int = 0,
         pipeline_type: str = "512",
-        material_mode: str = "image",
+        material_mode: str = "color",
         out_res: int = 256,
         alpha_threshold: float = 0.5,
         color_axis: str = "auto",
+        photo_match: Optional[bool] = None,
         downsample_device: Optional[str] = None,
         include_palette: bool = False,
         include_preview: bool = False,
@@ -404,7 +405,7 @@ class TrellisVoxRuntime:
         if pil.mode not in ("RGB", "RGBA"):
             pil = pil.convert("RGBA" if "A" in pil.getbands() else "RGB")
 
-        material_mode = (material_mode or "image").lower()
+        material_mode = (material_mode or "color").lower()
         pipeline_type = pipeline_type or "512"
         out_res = int(out_res)
         seed = int(seed)
@@ -415,6 +416,11 @@ class TrellisVoxRuntime:
             mode = "direct"
         if mode not in ("glb", "direct"):
             raise ValueError(f"unsupported convert mode: {mode!r} (use 'glb' or 'direct')")
+        photo_match = (
+            bool(photo_match)
+            if photo_match is not None
+            else os.environ.get("COLOR_TRANSFER", "1") != "0"
+        )
 
         with self._lock:
             t0 = time.time()
@@ -441,6 +447,7 @@ class TrellisVoxRuntime:
                     solid_material=1,
                     color_image=pre_image,
                     color_axis=color_axis or "auto",
+                    photo_match=photo_match,
                 )
                 native_size = (grid.size_x, grid.size_y, grid.size_z)
                 native_solid = grid.count_solid()
@@ -620,7 +627,7 @@ class TrellisVoxRuntime:
                     # Optional photo-matching for GLB path: re-paint solids from the input image.
                     force_photo = (
                         os.environ.get("PHOTO_COLOR", "1") != "0"
-                        and str(material_mode or "image").lower() not in ("texture", "glb", "baked")
+                        and str(material_mode or "color").lower() not in ("texture", "glb", "baked")
                     )
                     if force_photo:
                         print(
@@ -682,13 +689,14 @@ class TrellisVoxRuntime:
                     )
                     grid, palette = vox_io.grid_from_mesh_with_voxel(
                         mesh,
-                        material_mode=(os.environ.get("MATERIAL_MODE", "image") or "image").lower(),
+                        material_mode=(os.environ.get("MATERIAL_MODE", "color") or "color").lower(),
                         alpha_threshold=float(alpha_threshold),
                         max_colors=int(max_colors or os.environ.get("MAX_COLORS", "255")),
                         crop=True if crop is None else bool(crop),
                         solid_material=1,
                         color_image=pre_image,
                         color_axis=color_axis or "auto",
+                        photo_match=photo_match,
                     )
                     native_size = (grid.size_x, grid.size_y, grid.size_z)
                     native_solid = grid.count_solid()
@@ -704,7 +712,7 @@ class TrellisVoxRuntime:
                         use_zstd=True,
                         palette=palette,
                     )
-                    material_mode = (os.environ.get("MATERIAL_MODE", "image") or "image").lower()
+                    material_mode = (os.environ.get("MATERIAL_MODE", "color") or "color").lower()
                     mode = "glb+direct_fallback"
             elapsed = time.time() - t0
             print(
