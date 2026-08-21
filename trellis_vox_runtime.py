@@ -334,7 +334,7 @@ class TrellisVoxRuntime:
         ids = np.clip(data[solid].astype(np.int32) - 1, 0, len(pal) - 1)
         cols = pal[ids].astype(np.float32)
         out = np.zeros((grid.size_y, grid.size_x, 3), dtype=np.uint8)
-        order = np.lexsort((z, x, y))
+        order = np.lexsort((-z, x, y))
         y_s, x_s = y[order], x[order]
         cols_s = cols[order]
         keys = y_s.astype(np.int64) * (grid.size_x + 1) + x_s.astype(np.int64)

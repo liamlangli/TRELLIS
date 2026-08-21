@@ -1560,6 +1560,10 @@ def _base_color_plausible(base_rgb, color_image=None, *, max_colors: int = 255) 
         return False
     if color_image is None:
         return True
+    # Grey/washed decodes sit near every palette entry, so the NN distance
+    # below cannot reject them; compare chroma against the photo instead.
+    if palette_or_rgb_washed(rgb_u8, color_image):
+        return False
     try:
         img_pal = extract_image_palette(color_image, max_colors=min(int(max_colors), 64))
         dist = _nn_dist_to_palette(rgb_u8, img_pal)
