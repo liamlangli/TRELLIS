@@ -1187,6 +1187,7 @@ def transfer_colors_to_image(
     gain_min: float = 0.5,
     gain_max: float = 3.0,
     gamut_tolerance: float = 8.0,
+    snap_all: bool = False,
 ) -> np.ndarray:
     """Reinhard lab transfer: match palette stats to the photo foreground.
 
@@ -1220,6 +1221,14 @@ def transfer_colors_to_image(
         max_colors=VOX_PALETTE_MAX - 1,
         alpha_threshold=min(float(alpha_threshold), 0.1),
     )
+    if snap_all:
+        # Washed decodes mostly carry luma structure; re-anchor every entry
+        # to the nearest real photo color (Lab distance) so hues come from
+        # the source image while the decode keeps 3D-consistent placement.
+        lab_t = _rgb_to_lab(transferred.astype(np.float64))
+        lab_s = _rgb_to_lab(source_palette.astype(np.float64))
+        transferred = source_palette[_nearest_palette_ids(lab_t, lab_s)]
+        return transferred
     nearest_ids = _nearest_palette_ids(transferred, source_palette)
     nearest = source_palette[nearest_ids]
     distance = np.sqrt(
@@ -1560,10 +1569,6 @@ def _base_color_plausible(base_rgb, color_image=None, *, max_colors: int = 255) 
         return False
     if color_image is None:
         return True
-    # Grey/washed decodes sit near every palette entry, so the NN distance
-    # below cannot reject them; compare chroma against the photo instead.
-    if palette_or_rgb_washed(rgb_u8, color_image):
-        return False
     try:
         img_pal = extract_image_palette(color_image, max_colors=min(int(max_colors), 64))
         dist = _nn_dist_to_palette(rgb_u8, img_pal)
@@ -1712,6 +1717,12 @@ def grid_from_mesh_with_voxel(
         }
         base = attrs[:, layout["base_color"]]
         alpha = attrs[:, layout["alpha"]] if isinstance(layout, dict) and "alpha" in layout else None
+        washed = False
+        if color_image is not None:
+            try:
+                washed = palette_or_rgb_washed(base, color_image)
+            except Exception:
+                washed = False
         if not _base_color_plausible(base, color_image, max_colors=max_colors):
             raise ValueError("mesh base_color looks flat/noisy or unmatched to image")
         mats, pal = materials_from_colors(
@@ -1723,7 +1734,9 @@ def grid_from_mesh_with_voxel(
         )
         if photo_match and color_image is not None and pal.size:
             counts = np.bincount(mats[mats > 0], minlength=pal.shape[0] + 1)
-            pal = transfer_colors_to_image(pal, counts[1:].astype(np.float64), color_image)
+            pal = transfer_colors_to_image(
+                pal, counts[1:].astype(np.float64), color_image, snap_all=washed
+            )
         return mats, pal
 
     def _shell_weights(coords_i: np.ndarray, axis: str, band: int = 2) -> np.ndarray:
