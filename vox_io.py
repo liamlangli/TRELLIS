@@ -412,6 +412,40 @@ def downsample_grid(
     return out
 
 
+def downsample_grid_axis(
+    grid: VoxelGrid,
+    target_max: int,
+    *,
+    axis: str,
+    device: Optional[str] = None,
+) -> VoxelGrid:
+    """Uniformly downsample until one requested axis is within ``target_max``.
+
+    A uniform factor preserves voxel aspect ratio. ``axis`` is expressed in
+    logical VoxelGrid coordinates (x, y, or z), not NumPy array coordinates.
+    """
+    sizes = {"x": grid.size_x, "y": grid.size_y, "z": grid.size_z}
+    key = axis.lower()
+    if key not in sizes:
+        raise ValueError(f"unknown downsample axis {axis!r} (use x, y, or z)")
+    if target_max <= 0 or sizes[key] <= target_max:
+        return grid
+
+    factor = sizes[key] / float(target_max)
+    if abs(factor - round(factor)) < 1e-6:
+        return _downsample_dense_integer(grid, max(1, int(round(factor))), device=device)
+
+    z, y, x = np.where(grid.data != 0)
+    if z.size == 0:
+        return VoxelGrid.empty(1, 1, 1)
+    coords = np.stack([x, y, z], axis=1).astype(np.int64)
+    mats = grid.data[z, y, x].astype(np.uint8)
+    coords, mats = downsample_sparse(coords, mats, factor=factor, device=device)
+    if coords.shape[0] == 0:
+        return VoxelGrid.empty(1, 1, 1)
+    return VoxelGrid.from_coords(coords, materials=mats)
+
+
 def _bricks_on(size: int, brick: int = VOX2_BRICK) -> int:
     if size <= 0:
         return 0
@@ -1962,6 +1996,7 @@ __all__ = [
     "project_image_colors",
     "grid_from_mesh_with_voxel",
     "downsample_grid",
+    "downsample_grid_axis",
     "downsample_sparse",
     "write_palette_png",
     "LAST_PALETTE",

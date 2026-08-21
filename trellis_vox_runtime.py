@@ -141,7 +141,7 @@ class ConvertResult:
     seed: int
     pipeline_type: str
     material_mode: str
-    out_res: int
+    max_height: int
     elapsed_s: float
     palette_png: Optional[bytes] = None
     preview_png: Optional[bytes] = None
@@ -351,7 +351,7 @@ class TrellisVoxRuntime:
         seed: int = 0,
         pipeline_type: str = "512",
         material_mode: str = "color",
-        out_res: int = 256,
+        max_height: int = 256,
         alpha_threshold: float = 0.5,
         color_axis: str = "auto",
         photo_match: Optional[bool] = None,
@@ -407,7 +407,7 @@ class TrellisVoxRuntime:
 
         material_mode = (material_mode or "color").lower()
         pipeline_type = pipeline_type or "512"
-        out_res = int(out_res)
+        max_height = int(max_height)
         seed = int(seed)
         mode = (mode or os.environ.get("CONVERT_MODE", "direct") or "direct").strip().lower()
         if mode in ("full", "img_glb_vox", "image_glb_vox", "glb_path"):
@@ -426,7 +426,7 @@ class TrellisVoxRuntime:
             t0 = time.time()
             pre_image = self.pipeline.preprocess_image(pil)
             print(
-                f"[runtime] convert mode={mode} seed={seed} pipeline={pipeline_type} out_res={out_res}",
+                f"[runtime] convert mode={mode} seed={seed} pipeline={pipeline_type} max_height={max_height}",
                 flush=True,
             )
             meshes = self.pipeline.run(
@@ -451,13 +451,15 @@ class TrellisVoxRuntime:
                 )
                 native_size = (grid.size_x, grid.size_y, grid.size_z)
                 native_solid = grid.count_solid()
-                if out_res > 0 and max(grid.size_x, grid.size_y, grid.size_z) > out_res:
+                if max_height > 0 and grid.size_z > max_height:
                     ds_dev = (
                         downsample_device
                         if downsample_device is not None
                         else os.environ.get("DOWNSAMPLE_DEVICE")
                     )
-                    grid = vox_io.downsample_grid(grid, target_max=out_res, device=ds_dev)
+                    grid = vox_io.downsample_grid_axis(
+                        grid, target_max=max_height, axis="z", device=ds_dev
+                    )
                 vox_bytes = vox_io.encode(
                     vox_io.swap_yz(grid),
                     use_zstd=True,
@@ -568,7 +570,7 @@ class TrellisVoxRuntime:
                         except Exception as e:
                             print(f"[runtime] keep GLB failed: {e}", flush=True)
                     print(
-                        f"[runtime] GLB baked bytes={glb_path.stat().st_size} -> voxelize out_res={out_res}",
+                        f"[runtime] GLB baked bytes={glb_path.stat().st_size} -> voxelize max_height={max_height}",
                         flush=True,
                     )
                     bands = [s_band]
@@ -587,7 +589,7 @@ class TrellisVoxRuntime:
                             )
                             _, palette, stats, grid = convert_glb_file(
                                 glb_path,
-                                out_res=out_res,
+                                out_res=max_height,
                                 fill=fill,
                                 surface_band=band_try,
                                 pad_voxels=pad,
@@ -623,6 +625,17 @@ class TrellisVoxRuntime:
                     # GLB/glTF is Y-up already (no TRELLIS Z-up swap).
                     # Orient so default +Z camera matches source image: swap X/Z then flip X.
                     grid = vox_io.orient_glb_to_vox(grid)
+                    if max_height > 0 and grid.size_y > max_height:
+                        grid = vox_io.downsample_grid_axis(
+                            grid,
+                            target_max=max_height,
+                            axis="y",
+                            device=(
+                                downsample_device
+                                if downsample_device is not None
+                                else os.environ.get("DOWNSAMPLE_DEVICE")
+                            ),
+                        )
 
                     # Optional photo-matching for GLB path: re-paint solids from the input image.
                     force_photo = (
@@ -700,13 +713,15 @@ class TrellisVoxRuntime:
                     )
                     native_size = (grid.size_x, grid.size_y, grid.size_z)
                     native_solid = grid.count_solid()
-                    if out_res > 0 and max(grid.size_x, grid.size_y, grid.size_z) > out_res:
+                    if max_height > 0 and grid.size_z > max_height:
                         ds_dev = (
                             downsample_device
                             if downsample_device is not None
                             else os.environ.get("DOWNSAMPLE_DEVICE")
                         )
-                        grid = vox_io.downsample_grid(grid, target_max=out_res, device=ds_dev)
+                        grid = vox_io.downsample_grid_axis(
+                            grid, target_max=max_height, axis="z", device=ds_dev
+                        )
                     vox_bytes = vox_io.encode(
                         vox_io.swap_yz(grid),
                         use_zstd=True,
@@ -731,7 +746,7 @@ class TrellisVoxRuntime:
                 seed=seed,
                 pipeline_type=pipeline_type,
                 material_mode=material_mode,
-                out_res=out_res,
+                max_height=max_height,
                 elapsed_s=elapsed,
                 palette_png=palette_png,
                 preview_png=preview_png,
