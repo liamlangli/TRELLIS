@@ -7,11 +7,14 @@ Default path matches serve.bat:
 
 Usage:
     img_to_vox.py -i input.png [-o output.vox] [-h max_height] [--max_colors n]
-    img_to_vox.py --input_folder folder [-h max_height] [--max_colors n]
+    img_to_vox.py --input_folder folder [-h max_height] [--max_colors n] [--skip]
 
 When --input_folder is used, each image may have a sibling ``<stem>.conf``
 file with ``max_height = N`` / ``max_colors = N`` lines that override the
 CLI defaults for that image only.
+
+With ``--skip``, an existing target ``.vox`` is left as-is and that image is
+not converted again.
 
 Loads the model in-process. For repeated conversions without reloading
 weights, start server_vox.py / serve.bat and use tovox.bat instead.
@@ -69,13 +72,14 @@ def _usage() -> None:
     print(
         "Usage:\n"
         "  img_to_vox.py -i input.png [-o output.vox] [-h max_height] [--max_colors n]\n"
-        "  img_to_vox.py --input_folder folder [-h max_height] [--max_colors n]\n"
+        "  img_to_vox.py --input_folder folder [-h max_height] [--max_colors n] [--skip]\n"
         "\n"
         "  --input_folder writes every PNG/JPG/JPEG to folder/vox/*.vox\n"
         "                 per-image <stem>.conf may override max_height / max_colors\n"
         "                 (key = value lines, e.g. `max_height = 128`)\n"
         "  -h, --max_height  maximum VOX Y-axis resolution (1..1024, default 256)\n"
         "  --max_colors      maximum solid color count (1..255, default 255)\n"
+        "  --skip            skip conversion when the target .vox already exists\n"
         "\n"
         "Optional env overrides: CONVERT_MODE=glb|direct, SEED, PIPELINE_TYPE,\n"
         "MAX_HEIGHT, MAX_COLORS, COLOR_MODE, VOX_FILL, SURFACE_BAND, MATERIAL_MODE,\n"
@@ -158,6 +162,11 @@ def _parse_args() -> argparse.Namespace:
         "--max_colors",
         default=os.environ.get("MAX_COLORS", "255"),
         help="maximum solid color count (1..255, default: 255)",
+    )
+    parser.add_argument(
+        "--skip",
+        action="store_true",
+        help="skip conversion when the target .vox already exists",
     )
     parser.add_argument("--help", action="store_true", help="show this help and exit")
     args = parser.parse_args()
@@ -291,9 +300,16 @@ def main() -> int:
     rt.load(model=model)
 
     all_ok = True
+    skipped = 0
+    converted = 0
     for index, (image_path, out_path) in enumerate(zip(image_paths, output_paths), start=1):
         if len(image_paths) > 1:
             print(f"=== [{index}/{len(image_paths)}] {image_path.name} ===", flush=True)
+
+        if args.skip and out_path.is_file():
+            skipped += 1
+            print(f"skip: exists {out_path}", flush=True)
+            continue
 
         image_max_height = max_height
         image_max_colors = max_colors
@@ -326,11 +342,18 @@ def main() -> int:
                 max_height=image_max_height,
                 max_colors=image_max_colors,
             )
+            converted += 1
         except Exception as exc:
             all_ok = False
             print(f"error: failed to convert {image_path}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
-    print(f"batch total={time.time() - t0:.1f}s", flush=True)
+    if args.skip:
+        print(
+            f"batch total={time.time() - t0:.1f}s  converted={converted} skipped={skipped}",
+            flush=True,
+        )
+    else:
+        print(f"batch total={time.time() - t0:.1f}s", flush=True)
     return 0 if all_ok else 3
 
 
