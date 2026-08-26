@@ -78,7 +78,7 @@ def _usage() -> None:
         "                 per-image <stem>.conf may override max_height / max_colors\n"
         "                 (key = value lines, e.g. `max_height = 128`)\n"
         "  -h, --max_height  maximum VOX Y-axis resolution (1..1024, default 256)\n"
-        "  --max_colors      maximum solid color count (1..255, default 255)\n"
+        "  --max_colors      maximum solid color count (1..255, default 220)\n"
         "  --skip            skip conversion when the target .vox already exists\n"
         "\n"
         "Optional env overrides: CONVERT_MODE=glb|direct, SEED, PIPELINE_TYPE,\n"
@@ -160,8 +160,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max_colors",
-        default=os.environ.get("MAX_COLORS", "255"),
-        help="maximum solid color count (1..255, default: 255)",
+        default=os.environ.get("MAX_COLORS", "220"),
+        help="maximum solid color count (1..255, default: 220)",
     )
     parser.add_argument(
         "--skip",
