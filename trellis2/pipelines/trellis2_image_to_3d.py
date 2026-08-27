@@ -1,4 +1,5 @@
 from typing import *
+import time
 import torch
 import torch.nn as nn
 import numpy as np
@@ -382,7 +383,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if self.low_vram:
             self.models['shape_slat_decoder'].to(self.device)
             self.models['shape_slat_decoder'].low_vram = True
+        stage_t0 = time.time()
+        print(f"[decode] shape begin tokens={slat.coords.shape[0]}", flush=True)
         ret = self.models['shape_slat_decoder'](slat, return_subs=True)
+        torch.cuda.synchronize()
+        print(
+            f"[decode] shape done in {time.time() - stage_t0:.3f}s "
+            f"meshes={len(ret[0])} subs={len(ret[1])}",
+            flush=True,
+        )
         if self.low_vram:
             self.models['shape_slat_decoder'].cpu()
             self.models['shape_slat_decoder'].low_vram = False
@@ -447,7 +456,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         """
         if self.low_vram:
             self.models['tex_slat_decoder'].to(self.device)
+        stage_t0 = time.time()
+        print(f"[decode] texture begin tokens={slat.coords.shape[0]}", flush=True)
         ret = self.models['tex_slat_decoder'](slat, guide_subs=subs) * 0.5 + 0.5
+        torch.cuda.synchronize()
+        print(
+            f"[decode] texture done in {time.time() - stage_t0:.3f}s "
+            f"voxels={ret.coords.shape[0]}",
+            flush=True,
+        )
         if self.low_vram:
             self.models['tex_slat_decoder'].cpu()
         return ret
@@ -471,7 +488,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         tex_voxels = self.decode_tex_slat(tex_slat, subs)
         out_mesh = []
         for m, v in zip(meshes, tex_voxels):
+            stage_t0 = time.time()
             m.fill_holes()
+            torch.cuda.synchronize()
+            print(f"[decode] fill_holes done in {time.time() - stage_t0:.3f}s", flush=True)
             out_mesh.append(
                 MeshWithVoxel(
                     m.vertices, m.faces,
