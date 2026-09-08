@@ -209,3 +209,5 @@ __marimo__/
 .ext_build
 
 vox
+
+.DS_Store
