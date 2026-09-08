@@ -13,7 +13,6 @@ __attributes = {
     # SC-VAEs
     'SparseUnetVaeEncoder': 'sc_vaes.sparse_unet_vae',
     'SparseUnetVaeDecoder': 'sc_vaes.sparse_unet_vae',
-    'FlexiDualGridVaeEncoder': 'sc_vaes.fdg_vae',
     'FlexiDualGridVaeDecoder': 'sc_vaes.fdg_vae'
 }
 
@@ -63,7 +62,11 @@ def from_pretrained(path: str, **kwargs):
     with open(config_file, 'r') as f:
         config = json.load(f)
     model = __getattr__(config['name'])(**config['args'], **kwargs)
-    model.load_state_dict(load_file(model_file), strict=False)
+    incompatible = model.load_state_dict(load_file(model_file), strict=False)
+    # RoPE phases are generated from the config, not saved in upstream weights.
+    missing = [key for key in incompatible.missing_keys if key != 'rope_phases']
+    if missing or incompatible.unexpected_keys:
+        raise RuntimeError(f'Checkpoint mismatch: missing={missing}, unexpected={incompatible.unexpected_keys}')
 
     return model
 
@@ -75,4 +78,4 @@ if __name__ == '__main__':
     from .structured_latent_flow import SLatFlowModel, ElasticSLatFlowModel
         
     from .sc_vaes.sparse_unet_vae import SparseUnetVaeEncoder, SparseUnetVaeDecoder
-    from .sc_vaes.fdg_vae import FlexiDualGridVaeEncoder, FlexiDualGridVaeDecoder
+    from .sc_vaes.fdg_vae import FlexiDualGridVaeDecoder

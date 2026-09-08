@@ -1,27 +1,8 @@
 #!/usr/bin/env python3
-"""
-CLI: TRELLIS.2 image -> VOX2 (one-shot).
+"""CLI: image → TRELLIS.2 color voxels → VOX2 on Apple Silicon.
 
-Default path matches serve.bat:
-  image -> TRELLIS mesh -> textured GLB -> CuMesh voxelize -> VOX2
-
-Usage:
-    img_to_vox.py -i input.png [-o output.vox] [-h max_height] [--max_colors n]
-    img_to_vox.py --input_folder folder [-h max_height] [--max_colors n] [--skip]
-
-When --input_folder is used, each image may have a sibling ``<stem>.conf``
-file with ``max_height = N`` / ``max_colors = N`` lines that override the
-CLI defaults for that image only.
-
-With ``--skip``, an existing target ``.vox`` is left as-is and that image is
-not converted again.
-
-Loads the model in-process. For repeated conversions without reloading
-weights, start server_vox.py / serve.bat and use tovox.bat instead.
-
-Env: CONVERT_MODE=glb|direct (default direct), SEED, PIPELINE_TYPE, MAX_HEIGHT,
-     MATERIAL_MODE (direct only), COLOR_MODE/VOX_FILL/SURFACE_BAND (glb path),
-     TRELLIS_MODEL, ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE
+Use ./img_to_vox.sh --help for single-image and batch options.
+A sibling <stem>.conf can override max_height and max_colors.
 """
 
 from __future__ import annotations
@@ -43,17 +24,10 @@ def _ensure_venv() -> None:
         return
     if not VENV_PY.is_file():
         return
-    try:
-        using = Path(sys.executable).resolve()
-        target = VENV_PY.resolve()
-    except OSError:
-        return
-    if using == target:
-        os.environ["TRELLIS_VENV_OK"] = "1"
+    if Path(sys.prefix).absolute() == (ROOT / ".venv").absolute():
         return
     os.environ["TRELLIS_VENV_OK"] = "1"
-    print(f"re-exec with project venv: {target}", flush=True)
-    os.execv(str(target), [str(target), *sys.argv])
+    os.execv(str(VENV_PY), [str(VENV_PY), *sys.argv])
 
 
 _ensure_venv()
@@ -66,26 +40,6 @@ os.environ.setdefault("CONVERT_MODE", "direct")
 bootstrap_env()
 
 import vox_io  # noqa: E402
-
-
-def _usage() -> None:
-    print(
-        "Usage:\n"
-        "  img_to_vox.py -i input.png [-o output.vox] [-h max_height] [--max_colors n]\n"
-        "  img_to_vox.py --input_folder folder [-h max_height] [--max_colors n] [--skip]\n"
-        "\n"
-        "  --input_folder writes every PNG/JPG/JPEG to folder/vox/*.vox\n"
-        "                 per-image <stem>.conf may override max_height / max_colors\n"
-        "                 (key = value lines, e.g. `max_height = 128`)\n"
-        "  -h, --max_height  maximum VOX Y-axis resolution (1..1024, default 256)\n"
-        "  --max_colors      maximum solid color count (1..255, default 220)\n"
-        "  --skip            skip conversion when the target .vox already exists\n"
-        "\n"
-        "Optional env overrides: CONVERT_MODE=glb|direct, SEED, PIPELINE_TYPE,\n"
-        "MAX_HEIGHT, MAX_COLORS, COLOR_MODE, VOX_FILL, SURFACE_BAND, MATERIAL_MODE,\n"
-        "TRELLIS_MODEL, ALPHA_THR, COLOR_AXIS, DOWNSAMPLE_DEVICE",
-        file=sys.stderr,
-    )
 
 
 def _bounded_int(value: str, name: str, minimum: int, maximum: int) -> int:
@@ -145,11 +99,11 @@ def _parse_args() -> argparse.Namespace:
         add_help=False,
     )
     inputs = parser.add_mutually_exclusive_group()
-    inputs.add_argument("-i", "--input", type=Path, help="input PNG/JPG/JPEG image")
+    inputs.add_argument("-i", "--input", type=Path, help="input PNG/JPG/JPEG/WEBP image")
     inputs.add_argument(
         "--input_folder",
         type=Path,
-        help="convert all PNG/JPG/JPEG images in this folder",
+        help="convert all PNG/JPG/JPEG/WEBP images in this folder",
     )
     parser.add_argument("-o", "--output", type=Path, help="output VOX path (single input only)")
     parser.add_argument(
@@ -214,15 +168,11 @@ def _convert_one(
     if result.preview_png:
         out_path.with_name(out_path.stem + "_preview_xy.png").write_bytes(result.preview_png)
 
-    try:
-        from PIL import Image
+    if result.preprocessed_png:
+        out_path.with_name(out_path.stem + "_pre.png").write_bytes(result.preprocessed_png)
 
-        pre = rt.pipeline.preprocess_image(Image.open(image_path))
-        pre.save(out_path.with_name(out_path.stem + "_pre.png"))
-    except Exception:
-        pass
-
-    rt_grid = vox_io.read(out_path)
+    # decode() preserves the file's Y-up axes; read() converts back to TRELLIS Z-up.
+    rt_grid = vox_io.decode(out_path.read_bytes())
     ok = (
         rt_grid.size_x == result.size_x
         and rt_grid.size_y == result.size_y
@@ -276,13 +226,17 @@ def main() -> int:
         image_paths = sorted(
             path
             for path in args.input_folder.iterdir()
-            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
         )
         if not image_paths:
-            print(f"error: no PNG/JPG/JPEG images found in {args.input_folder}", file=sys.stderr)
+            print(f"error: no PNG/JPG/JPEG/WEBP images found in {args.input_folder}", file=sys.stderr)
             return 1
         vox_dir = args.input_folder / "vox"
         output_paths = [vox_dir / f"{path.stem}.vox" for path in image_paths]
+
+    if len(set(output_paths)) != len(output_paths):
+        print("error: images with the same stem would overwrite the same .vox; rename them first", file=sys.stderr)
+        return 2
 
     try:
         import transformers  # noqa: F401
@@ -297,7 +251,6 @@ def main() -> int:
 
     t0 = time.time()
     rt = TrellisVoxRuntime()
-    rt.load(model=model)
 
     all_ok = True
     skipped = 0
@@ -332,6 +285,8 @@ def main() -> int:
                 )
 
         try:
+            if not rt.ready:
+                rt.load(model=model)
             all_ok &= _convert_one(
                 rt,
                 image_path,
@@ -345,6 +300,9 @@ def main() -> int:
             converted += 1
         except Exception as exc:
             all_ok = False
+            if os.environ.get("TRELLIS_DEBUG") == "1":
+                import traceback
+                traceback.print_exc()
             print(f"error: failed to convert {image_path}: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     if args.skip:

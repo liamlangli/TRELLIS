@@ -1,6 +1,1 @@
-from . import models
-from . import modules
-from . import pipelines
-from . import renderers
-from . import representations
-from . import utils
+"""TRELLIS.2 voxel inference on Apple Silicon."""

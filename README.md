@@ -1,343 +1,101 @@
-![](assets/teaser.webp)
+# TRELLIS.2 图片生成体素 · Mac Studio
 
-# Native and Compact Structured Latents for 3D Generation
+本分支只保留 **图片 → TRELLIS.2 三维生成 → 彩色体素 → VOX2**。
+使用 Apple Silicon 的 PyTorch MPS，不需要 NVIDIA、CUDA、Conda 或 Xcode Metal 编译器。
+原有 Web UI、训练、数据工具、GLB/纹理烘焙、网格处理和 CUDA 扩展已经移除。
 
-<a href="https://arxiv.org/abs/2512.14692"><img src="https://img.shields.io/badge/Paper-Arxiv-b31b1b.svg" alt="Paper"></a>
-<a href="https://huggingface.co/microsoft/TRELLIS.2-4B"><img src="https://img.shields.io/badge/Hugging%20Face-Model-yellow" alt="Hugging Face"></a>
-<a href="https://huggingface.co/spaces/microsoft/TRELLIS.2"><img src="https://img.shields.io/badge/Hugging%20Face-Demo-blueviolet"></a>
-<a href="https://microsoft.github.io/TRELLIS.2"><img src="https://img.shields.io/badge/Project-Website-blue" alt="Project Page"></a>
-<a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
+## 安装和运行
 
-https://github.com/user-attachments/assets/63b43a7e-acc7-4c81-a900-6da450527d8f
+在项目目录执行：
 
-*(Compressed version due to GitHub size limits. See the full-quality video on our project page!)*
-
-**TRELLIS.2** is a state-of-the-art large 3D generative model (4B parameters) designed for high-fidelity **image-to-3D** generation. It leverages a novel "field-free" sparse voxel structure termed **O-Voxel** to reconstruct and generate arbitrary 3D assets with complex topologies, sharp features, and full PBR materials.
-
-
-## ✨ Features
-
-### 1. High Quality, Resolution & Efficiency
-Our 4B-parameter model generates high-resolution fully textured assets with exceptional fidelity and efficiency using vanilla DiTs. It utilizes a Sparse 3D VAE with 16× spatial downsampling to encode assets into a compact latent space.
-
-| Resolution | Total Time* | Breakdown (Shape + Mat) |
-| :--- | :--- | :--- |
-| **512³** | **~3s** | 2s + 1s |
-| **1024³** | **~17s** | 10s + 7s |
-| **1536³** | **~60s** | 35s + 25s |
-
-<small>*Tested on NVIDIA H100 GPU.</small>
-
-### 2. Arbitrary Topology Handling
-The **O-Voxel** representation breaks the limits of iso-surface fields. It robustly handles complex structures without lossy conversion:
-*   ✅ **Open Surfaces** (e.g., clothing, leaves)
-*   ✅ **Non-manifold Geometry**
-*   ✅ **Internal Enclosed Structures**
-
-### 3. Rich Texture Modeling
-Beyond basic colors, TRELLIS.2 models arbitrary surface attributes including **Base Color, Roughness, Metallic, and Opacity**, enabling photorealistic rendering and transparency support.
-
-### 4. Minimalist Processing
-Data processing is streamlined for instant conversions that are fully **rendering-free** and **optimization-free**.
-*   **< 10s** (Single CPU): Textured Mesh → O-Voxel
-*   **< 100ms** (CUDA): O-Voxel → Textured Mesh
-
-
-## 🗺️ Roadmap
-
-- [x] Paper release
-- [x] Release image-to-3D inference code
-- [x] Release pretrained checkpoints (4B)
-- [x] Hugging Face Spaces demo
-- [x] Release shape-conditioned texture generation inference code
-- [x] Release training code
-
-
-## 🛠️ Installation
-
-### Prerequisites
-- **System**: The code is currently tested only on **Linux**.
-- **Hardware**: An NVIDIA GPU with at least 24GB of memory is necessary. The code has been verified on NVIDIA A100 and H100 GPUs.  
-- **Software**:   
-  - The [CUDA Toolkit](https://developer.nvidia.com/cuda-toolkit-archive) is needed to compile certain packages. Recommended version is 12.4.  
-  - [Conda](https://docs.anaconda.com/miniconda/install/#quick-command-line-install) is recommended for managing dependencies.  
-  - Python version 3.8 or higher is required. 
-
-### Installation Steps
-1. Clone the repo:
-    ```sh
-    git clone -b main https://github.com/microsoft/TRELLIS.2.git --recursive
-    cd TRELLIS.2
-    ```
-
-2. Install the dependencies:
-    
-    **Before running the following command there are somethings to note:**
-    - By adding `--new-env`, a new conda environment named `trellis2` will be created. If you want to use an existing conda environment, please remove this flag.
-    - By default the `trellis2` environment will use pytorch 2.6.0 with CUDA 12.4. If you want to use a different version of CUDA, you can remove the `--new-env` flag and manually install the required dependencies. Refer to [PyTorch](https://pytorch.org/get-started/previous-versions/) for the installation command.
-    - If you have multiple CUDA Toolkit versions installed, `CUDA_HOME` should be set to the correct version before running the command. For example, if you have CUDA Toolkit 12.4 and 13.0 installed, you can run `export CUDA_HOME=/usr/local/cuda-12.4` before running the command.
-    - By default, the code uses the `flash-attn` backend for attention. For GPUs do not support `flash-attn` (e.g., NVIDIA V100), you can install `xformers` manually and set the `ATTN_BACKEND` environment variable to `xformers` before running the code. See the [Minimal Example](#minimal-example) for more details.
-    - The installation may take a while due to the large number of dependencies. Please be patient. If you encounter any issues, you can try to install the dependencies one by one, specifying one flag at a time.
-    - If you encounter any issues during the installation, feel free to open an issue or contact us.
-    
-    Create a new conda environment named `trellis2` and install the dependencies:
-    ```sh
-    . ./setup.sh --new-env --basic --flash-attn --nvdiffrast --nvdiffrec --cumesh --o-voxel --flexgemm
-    ```
-    The detailed usage of `setup.sh` can be found by running `. ./setup.sh --help`.
-    ```sh
-    Usage: setup.sh [OPTIONS]
-    Options:
-        -h, --help              Display this help message
-        --new-env               Create a new conda environment
-        --basic                 Install basic dependencies
-        --flash-attn            Install flash-attention
-        --cumesh                Install cumesh
-        --o-voxel               Install o-voxel
-        --flexgemm              Install flexgemm
-        --nvdiffrast            Install nvdiffrast
-        --nvdiffrec             Install nvdiffrec
-    ```
-
-## 📦 Pretrained Weights
-
-The pretrained model **TRELLIS.2-4B** is available on Hugging Face. Please refer to the model card there for more details.
-
-| Model | Parameters | Resolution | Link |
-| :--- | :--- | :--- | :--- |
-| **TRELLIS.2-4B** | 4 Billion | 512³ - 1536³ | [Hugging Face](https://huggingface.co/microsoft/TRELLIS.2-4B) |
-
-
-## 🚀 Usage
-
-### 1. Image to 3D Generation
-
-#### Minimal Example
-
-Here is an [example](example.py) of how to use the pretrained models for 3D asset generation.
-
-```python
-import os
-os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # Can save GPU memory
-import cv2
-import imageio
-from PIL import Image
-import torch
-from trellis2.pipelines import Trellis2ImageTo3DPipeline
-from trellis2.utils import render_utils
-from trellis2.renderers import EnvMap
-import o_voxel
-
-# 1. Setup Environment Map
-envmap = EnvMap(torch.tensor(
-    cv2.cvtColor(cv2.imread('assets/hdri/forest.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-    dtype=torch.float32, device='cuda'
-))
-
-# 2. Load Pipeline
-pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
-pipeline.cuda()
-
-# 3. Load Image & Run
-image = Image.open("assets/example_image/T.png")
-mesh = pipeline.run(image)[0]
-mesh.simplify(16777216) # nvdiffrast limit
-
-# 4. Render Video
-video = render_utils.make_pbr_vis_frames(render_utils.render_video(mesh, envmap=envmap))
-imageio.mimsave("sample.mp4", video, fps=15)
-
-# 5. Export to GLB
-glb = o_voxel.postprocess.to_glb(
-    vertices            =   mesh.vertices,
-    faces               =   mesh.faces,
-    attr_volume         =   mesh.attrs,
-    coords              =   mesh.coords,
-    attr_layout         =   mesh.layout,
-    voxel_size          =   mesh.voxel_size,
-    aabb                =   [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-    decimation_target   =   1000000,
-    texture_size        =   4096,
-    remesh              =   True,
-    remesh_band         =   1,
-    remesh_project      =   0,
-    verbose             =   True
-)
-glb.export("sample.glb", extension_webp=True)
+```bash
+./setup.sh
 ```
 
-Upon execution, the script generates the following files:
- - `sample.mp4`: A video visualizing the generated 3D asset with PBR materials and environmental lighting.
- - `sample.glb`: The extracted PBR-ready 3D asset in GLB format.
+安装脚本创建项目自己的 `.venv`。当前依赖版本针对原生 arm64 Python 3.14；本机已安装在 Homebrew 中。`requirements.lock.txt` 固定本机验证过的完整依赖版本。
 
-**Note:** The `.glb` file is exported in `OPAQUE` mode by default. Although the alpha channel is preserved within the texture map, it is not active initially. To enable transparency, import the asset into your 3D software and manually connect the texture's alpha channel to the material's opacity or alpha input.
+批量处理：把 PNG/JPG/JPEG/WEBP 图片放进项目的 `vox/` 目录，然后：
 
-#### One-shot Image to GLB
-
-Use [img_to_glb.py](img_to_glb.py) to run the default web-demo generation and GLB export flow directly from the command line:
-```sh
-python img_to_glb.py assets/example_image/T.png output.glb
+```bash
+./img_to_vox.sh
 ```
 
-The script defaults to the 1024 cascade pipeline, a 500,000-face decimation target, and a 2048-pixel texture. Set `SEED`, `RESOLUTION`, `DECIMATION_TARGET`, `TEXTURE_SIZE`, or `REMESH` to override the defaults.
+结果位于 `vox/vox/`，与旧批处理的 `输入文件夹/vox/` 规则一致。已有 `.vox` 自动跳过。
+脚本可从任意工作目录启动；传入的相对路径相对于调用时的目录。
 
-#### Web Demo
+单张图片或指定文件夹：
 
-[app.py](app.py) provides a simple web demo for image to 3D asset generation. you can run the demo with the following command:
-```sh
-python app.py
+```bash
+./img_to_vox.sh -i /path/to/image.png -o /path/to/result.vox -h 128
+./img_to_vox.sh --input_folder /path/to/images --skip --max_colors 128
+./img_to_vox.sh --help
 ```
 
-Then, you can access the demo at the address shown in the terminal.
+注意：`-h` 保留旧脚本语义，表示最大高度；帮助使用 `--help`。
+同一输入文件夹不能存在同名但扩展名不同的图片，例如 `a.png` 和 `a.jpg`，以免覆盖输出。
 
-### 2. PBR Texture Generation
+每张图片生成：
 
-Please refer to the [example_texturing.py](example_texturing.py) for an example of how to generate PBR textures for a given 3D shape. Also, you can use the [app_texturing.py](app_texturing.py) to run a web demo for PBR texture generation.
+- `名称.vox`：三维体素数据及调色板。
+- `名称.palette.png`：调色板。
+- `名称_preview_xy.png`：正面投影预览。
+- `名称_pre.png`：模型实际使用的预处理图片。
 
+这里的 `.vox` 是项目原有的 **VOX2 自定义格式**，不是 MagicaVoxel 的 `VOX ` 格式。
+格式定义保留在 `vox_codec.ns`，Python 读写器是 `vox_io.py`。
 
-## 🏋️ Training
+## 参数与模型
 
-We provide the full training codebase, enabling users to train **TRELLIS.2** from scratch or fine-tune it on custom datasets.
+默认用 512 推理流程，输出最大高度 256、最多 220 种颜色。
+`-h` 只控制最终体素的高度，不改变神经网络推理分辨率。
+为了适配 36 GB 统一内存，只加载 512 所需模型，按阶段移入 MPS；没有加载 1024/1536 模型。
+颜色解码器仍然保留，因为它生成体素颜色和透明度；不进行贴图烘焙。
 
-### 1. Data Preparation
+首次生成会从 Hugging Face 下载模型（约 10 GB，另有抠图模型），缓存于 `~/.cache/huggingface/`。
+后续生成复用缓存。透明背景图片直接使用 alpha；不透明图片按需加载 BiRefNet 抠图。
+同一批次复用模型，不需要每张图重新加载。
 
-Before training, raw 3D assets must be converted into the **O-Voxel** representation. This process includes mesh conversion, compact structured latent generation, and metadata preparation.
+支持环境变量：
 
-> 📂 **Please refer to [data_toolkit/README.md](data_toolkit/README.md) for detailed instructions on data preprocessing and dataset organization.**
+| 参数 | 默认值 | 含义 |
+|---|---|---|
+| `SEED` | `0` | 随机种子 |
+| `STEPS` | `12` | 三个生成阶段的采样步数，1–100 |
+| `MAX_HEIGHT` | `256` | 最终 VOX Y 轴高度上限，1–1024 |
+| `MAX_COLORS` | `220` | 色数上限，1–255 |
+| `MATERIAL_MODE` | `color` | `color`、`auto`、`image`、`solid` |
+| `TRELLIS_DEVICE` | `mps` | 本机默认 MPS；可设 `cpu` 排查问题 |
+| `TRELLIS_MODEL` | `microsoft/TRELLIS.2-4B` | TRELLIS 权重目录或仓库 |
+| `DINO_MODEL` | `camenduru/dinov3-vitl16-pretrain-lvd1689m` | 沿用原脚本的特征模型仓库 |
+| `REMBG_MODEL` | `ZhengPeng7/BiRefNet` | 沿用原脚本的抠图模型仓库 |
 
-### 2. Running Training
+例如：
 
-Training is managed through the `train.py` script, which accepts multiple command-line arguments to configure experiments:
-
-* `--config`: Path to the experiment configuration file.
-* `--output_dir`: Directory for training outputs.
-* `--load_dir`: Directory to load checkpoints from (defaults to `output_dir`).
-* `--ckpt`: Checkpoint step to resume from (defaults to the latest).
-* `--data_dir`: Dataset path or a JSON string specifying dataset locations.
-* `--auto_retry`: Number of automatic retries upon failure.
-* `--tryrun`: Perform a dry run without actual training.
-* `--profile`: Enable training profiling.
-* `--num_nodes`: Number of nodes for distributed training.
-* `--node_rank`: Rank of the current node.
-* `--num_gpus`: Number of GPUs per node (defaults to all available GPUs).
-* `--master_addr`: Master node address for distributed training.
-* `--master_port`: Port for distributed training communication.
-
-
-### SC-VAE Training
-
-
-To train the shape SC-VAE, run:
-
-```sh
-python train.py \
-  --config configs/scvae/shape_vae_next_dc_f16c32_fp16.json \
-  --output_dir results/shape_vae_next_dc_f16c32_fp16 \
-  --data_dir "{\"ObjaverseXL_sketchfab\": {\"base\": \"datasets/ObjaverseXL_sketchfab\", \"mesh_dump\": \"datasets/ObjaverseXL_sketchfab/mesh_dumps\", \"dual_grid\": \"datasets/ObjaverseXL_sketchfab/dual_grid_256\", \"asset_stats\": \"datasets/ObjaverseXL_sketchfab/asset_stats\"}}"
+```bash
+SEED=42 ./img_to_vox.sh -i image.png -h 128
 ```
 
-This command trains the shape SC-VAE on the **Objaverse-XL** dataset using the `shape_vae_next_dc_f16c32_fp16.json` configuration. Training outputs will be saved to `results/shape_vae_next_dc_f16c32_fp16`.
+批量输入可在图片旁添加同名 `.conf`，覆盖该图片的输出参数：
 
-The dataset is specified as a JSON string, where each dataset entry includes:
-
-* `base`: Root directory of the dataset.
-* `mesh_dump`: Directory containing preprocessed mesh dumps.
-* `dual_grid`: Directory with precomputed dual-grid representations.
-* `asset_stats`: Directory containing precomputed asset statistics.
-
-To fine-tune the model at a higher resolution, use the `shape_vae_next_dc_f16c32_fp16_ft_512.json` configuration. Remember to update the `finetune_ckpt` field and adjust the dataset paths accordingly.
-
-
-To train the texture SC-VAE, run:
-
-```sh
-python train.py \
-  --config configs/scvae/tex_vae_next_dc_f16c32_fp16.json \
-  --output_dir results/tex_vae_next_dc_f16c32_fp16 \
-  --data_dir "{\"ObjaverseXL_sketchfab\": {\"base\": \"datasets/ObjaverseXL_sketchfab\", \"pbr_dump\": \"datasets/ObjaverseXL_sketchfab/pbr_dumps\", \"pbr_voxel\": \"datasets/ObjaverseXL_sketchfab/pbr_voxels_256\", \"asset_stats\": \"datasets/ObjaverseXL_sketchfab/asset_stats\"}}"
+```ini
+# image.conf
+max_height = 128
+max_colors = 100
 ```
 
+## 验证
 
-### Flow Model Training
-
-To train the sparse structure flow model, run:
-
-```sh
-python train.py \
-  --config configs/gen/ss_flow_img_dit_1_3B_64_bf16.json \
-  --output_dir results/ss_flow_img_dit_1_3B_64_bf16 \
-  --data_dir "{\"ObjaverseXL_sketchfab\": {\"base\": \"datasets/ObjaverseXL_sketchfab\", \"ss_latent\": \"datasets/ObjaverseXL_sketchfab/ss_latents/ss_enc_conv3d_16l8_fp16_64\", \"render_cond\": \"datasets/ObjaverseXL_sketchfab/renders_cond\"}}"
+```bash
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-This command trains the sparse-structure flow model on the **Objaverse-XL** dataset using the specified configuration file. Outputs are saved to `results/ss_flow_img_dit_1_3B_64_bf16`.
+回归测试比较 CPU/MPS 稀疏卷积与标准 dense Conv3d、不同长度序列的注意力、旋转位置编码，以及非立方体 VOX 的坐标和文件读回。每次实际转换还检查写出文件的尺寸及实心体素数量。
 
-The dataset configuration includes:
+本机实测（2026-09-08）：Mac Studio M4 Max / 36 GB / macOS 27.0 / Python 3.14.3。
+使用项目皇冠示例，`SEED=0`、12 步、最大高度 128：输出 **214 × 128 × 211**、**202,322** 个实心体素、220 色，文件 **324,491 bytes**。
+最终批量运行退出码 0、`roundtrip=OK`；转换约 **96 秒**，包含缓存模型加载总共约 **148 秒**。
+9 项回归测试全部通过，另已实际验证普通 RGB 图片的 MPS 抠图。
+示例输入在 `vox/crown.webp`，结果在 `vox/vox/crown.vox`（`vox/` 已被 Git 忽略）。
 
-* `base`: Root dataset directory.
-* `ss_latent`: Directory containing precomputed sparse-structure latents.
-* `render_cond`: Directory containing conditional rendering images.
-
-
-The second- and third-stage flow models for shape and texture generation can be trained using the following configurations:
-
-* Shape flow: `slat_flow_img2shape_dit_1_3B_512_bf16.json`
-* Texture flow: `slat_flow_imgshape2tex_dit_1_3B_512_bf16.json`
-
-Example commands:
-
-```sh
-# Shape flow model
-python train.py \
-  --config configs/gen/slat_flow_img2shape_dit_1_3B_512_bf16.json \
-  --output_dir results/slat_flow_img2shape_dit_1_3B_512_bf16 \
-  --data_dir "{\"ObjaverseXL_sketchfab\": {\"base\": \"datasets/ObjaverseXL_sketchfab\", \"shape_latent\": \"datasets/ObjaverseXL_sketchfab/shape_latents/shape_enc_next_dc_f16c32_fp16_512\", \"render_cond\": \"datasets/ObjaverseXL_sketchfab/renders_cond\"}}"
-
-# Texture flow model
-python train.py \
-  --config configs/gen/slat_flow_imgshape2tex_dit_1_3B_512_bf16.json \
-  --output_dir results/slat_flow_imgshape2tex_dit_1_3B_512_bf16 \
-  --data_dir "{\"ObjaverseXL_sketchfab\": {\"base\": \"datasets/ObjaverseXL_sketchfab\", \"shape_latent\": \"datasets/ObjaverseXL_sketchfab/shape_latents/shape_enc_next_dc_f16c32_fp16_512\", \"pbr_latent\": \"datasets/ObjaverseXL_sketchfab/pbr_latents/tex_enc_next_dc_f16c32_fp16_512\", \"render_cond\": \"datasets/ObjaverseXL_sketchfab/renders_cond\"}}"
-```
-
-Higher-resolution fine-tuning can be performed by updating the `finetune_ckpt` field in the following configuration files and adjusting the dataset paths accordingly:
-
-* `slat_flow_img2shape_dit_1_3B_512_bf16_ft1024.json`
-* `slat_flow_imgshape2tex_dit_1_3B_512_bf16_ft1024.json`
-
-
-## 🧩 Related Packages
-
-TRELLIS.2 is built upon several specialized high-performance packages developed by our team:
-
-*   **[O-Voxel](o-voxel):** 
-    Core library handling the logic for converting between textured meshes and the O-Voxel representation, ensuring instant bidirectional transformation.
-*   **[FlexGEMM](https://github.com/JeffreyXiang/FlexGEMM):** 
-    Efficient sparse convolution implementation based on Triton, enabling rapid processing of sparse voxel structures.
-*   **[CuMesh](https://github.com/JeffreyXiang/CuMesh):** 
-    CUDA-accelerated mesh utilities used for high-speed post-processing, remeshing, decimation, and UV-unwrapping.
-
-
-## ⚖️ License
-
-This model and code are released under the **[MIT License](LICENSE)**.
-
-Please note that certain dependencies operate under separate license terms:
-
-- [**nvdiffrast**](https://github.com/NVlabs/nvdiffrast): Utilized for rendering generated 3D assets. This package is governed by its own [License](https://github.com/NVlabs/nvdiffrast/blob/main/LICENSE.txt).
-
-- [**nvdiffrec**](https://github.com/NVlabs/nvdiffrec): Implements the split-sum renderer for PBR materials. This package is governed by its own [License](https://github.com/NVlabs/nvdiffrec/blob/main/LICENSE.txt).
-
-## 📚 Citation
-
-If you find this model useful for your research, please cite our work:
-
-```bibtex
-@article{
-    xiang2025trellis2,
-    title={Native and Compact Structured Latents for 3D Generation},
-    author={Xiang, Jianfeng and Chen, Xiaoxue and Xu, Sicheng and Wang, Ruicheng and Lv, Zelong and Deng, Yu and Zhu, Hongyuan and Dong, Yue and Zhao, Hao and Yuan, Nicholas Jing and Yang, Jiaolong},
-    journal={Tech report},
-    year={2025}
-}
-```
+Apple Silicon 适配思路参考 [trellis-mac](https://github.com/shivampkumar/trellis-mac)。本分支直接返回解码体素，没有引入其网格提取或纹理烘焙依赖。
+TRELLIS.2 来源于 [Microsoft TRELLIS.2](https://github.com/microsoft/TRELLIS.2)，保留原 MIT LICENSE；模型按各模型仓库的许可使用。

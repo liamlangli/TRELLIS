@@ -19,6 +19,10 @@ class BiRefNet:
             ]
         )
     
+    @property
+    def device(self):
+        return next(self.model.parameters()).device
+
     def to(self, device: str):
         self.model.to(device)
 
@@ -30,7 +34,7 @@ class BiRefNet:
         
     def __call__(self, image: Image.Image) -> Image.Image:
         image_size = image.size
-        input_images = self.transform_image(image).unsqueeze(0).to("cuda")
+        input_images = self.transform_image(image).unsqueeze(0).to(self.device)
         # Prediction
         with torch.no_grad():
             preds = self.model(input_images)[-1].sigmoid().cpu()
